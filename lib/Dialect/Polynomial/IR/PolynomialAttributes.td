@@ -5,6 +5,7 @@ include "lib/Dialect/Polynomial/IR/PolynomialDialect.td"
 include "mlir/IR/BuiltinAttributeInterfaces.td"
 include "mlir/IR/OpBase.td"
 include "mlir/IR/OpAsmInterface.td"
+include "mlir/IR/EnumAttr.td"
 
 class Polynomial_Attr<string name, string attrMnemonic, list<Trait> traits = []>
     : AttrDef<Polynomial_Dialect, name, traits> {
@@ -233,11 +234,14 @@ def Polynomial_RingAttr : Polynomial_Attr<"Ring", "ring", [OpAsmAttrInterface]> 
 }
 
 def Polynomial_PrimitiveRootAttr: Polynomial_Attr<"PrimitiveRoot", "primitive_root"> {
-  let summary = "an attribute containing an integer and its degree as a root of unity";
+  let summary = "an attribute containing a typed root value and its degree as a root of unity";
   let description = [{
-    A primitive root attribute stores an integer root `value` and an integer
-    `degree`, corresponding to a primitive root of unity of the given degree in
-    an unspecified ring.
+    A primitive root attribute stores a typed root `value` and an integer
+    `degree`, corresponding to a primitive root of unity of the given degree.
+
+    The root value is represented as either:
+    - `#mod_arith.value<...>` for a single modular coefficient ring, or
+    - `#rns.value<...>` for an RNS coefficient ring.
 
     This is used as an attribute on `polynomial.ntt` and `polynomial.intt` ops
     to specify the root of unity used in lowering the transform.
@@ -245,12 +249,13 @@ def Polynomial_PrimitiveRootAttr: Polynomial_Attr<"PrimitiveRoot", "primitive_ro
     Example:
 
     ```mlir
-    #poly = #polynomial.primitive_root<value=123 : i32, degree : 7 index>
+    #v = #mod_arith.value<type=!mod_arith.int<17 : i32>, value=3 : i32>
+    #poly = #polynomial.primitive_root<value=#v, degree=8 : i32>
     ```
   }];
   let parameters = (ins
-    "::mlir::IntegerAttr":$value,
-    "::mlir::IntegerAttr":$degree
+    "::mlir::Attribute":$value,
+    "IntegerAttr":$degree
   );
   let assemblyFormat = "`<` struct(params) `>`";
 }

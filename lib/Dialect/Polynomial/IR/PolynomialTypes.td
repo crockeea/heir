@@ -15,10 +15,22 @@ def Polynomial_PolynomialType : Polynomial_Type<"Polynomial", "polynomial", [OpA
   let description = [{
     A type for polynomials in a polynomial quotient ring.
   }];
-  let parameters = (ins Polynomial_RingAttr:$ring);
+  let parameters = (ins
+    Polynomial_RingAttr:$ring,
+    DefaultValuedParameter<
+      "::mlir::heir::polynomial::Form",
+      "::mlir::heir::polynomial::Form::COEFF">:$form
+  );
   let assemblyFormat = "`<` struct(params) `>`";
 
   let extraClassDeclaration = [{
+    // Backward-compatible builder: defaults to coefficient form.
+    static PolynomialType get(
+        ::mlir::MLIRContext *context,
+        ::mlir::heir::polynomial::RingAttr ring) {
+      return PolynomialType::get(context, ring, ::mlir::heir::polynomial::Form::COEFF);
+    }
+
     // OpAsmTypeInterface methods.
     ::mlir::OpAsmDialectInterface::AliasResult getAlias(::llvm::raw_ostream &os) const {
       os << "poly";
