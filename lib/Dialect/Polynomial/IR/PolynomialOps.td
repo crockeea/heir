@@ -351,7 +351,8 @@ def Polynomial_INTTOp : Polynomial_Op<"intt", [Pure, ElementwiseMappable, Declar
     `polynomial.ntt`). The ring of the polynomial is taken from the required
     encoding attribute of the tensor.
 
-    The choice of primitive root may be optionally specified.
+    The choice of primitive root may be optionally specified. If specified,
+    it should be the multiplicative inverse of the primitive root provided to NTT.
   }];
   let arguments = (
     ins PolynomialLike:$input,
