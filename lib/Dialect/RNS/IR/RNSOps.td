@@ -67,7 +67,7 @@ def RNS_PackOp : RNS_Op<"pack", [Pure, DeclareOpInterfaceMethods<InferTypeOpInte
     ```
   }];
 
-  let arguments = (ins Variadic<ModArith>:$input);
+  let arguments = (ins Variadic<ModArith_ModArithType>:$input);
   let results = (outs RNS:$output);
   let assemblyFormat = "operands attr-dict `:` type($input)";
 }

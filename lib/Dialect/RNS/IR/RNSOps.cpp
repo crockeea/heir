@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 
+#include "lib/Dialect/ModArith/IR/ModArithTypes.h"
 #include "lib/Dialect/RNS/IR/RNSOps.h"
 #include "lib/Dialect/RNS/IR/RNSTypes.h"
 #include "mlir/include/mlir/IR/BuiltinAttributes.h"      // from @llvm-project
