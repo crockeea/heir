@@ -15,6 +15,7 @@
 // IWYU pragma: end_keep
 
 #define GET_OP_CLASSES
+#include "lib/Dialect/ModArith/IR/ModArithTypes.h"
 #include "lib/Dialect/RNS/IR/RNSOps.h.inc"
 
 namespace mlir {
