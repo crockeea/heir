@@ -12,9 +12,30 @@ package(
 cc_library(
     name = "Dialect",
     srcs = [
+        "ModArithOps.cpp",
+    ],
+    hdrs = [
+        "ModArithOps.h",
+    ],
+    deps = [
+        ":Types",
+        ":canonicalization_inc_gen",
+        ":ops_inc_gen",
+        "@heir//lib/Dialect/RNS/IR:Dialect",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:CommonFolders",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:InferTypeOpInterface",
+        "@llvm-project//mlir:Support",
+    ],
+)
+
+cc_library(
+    name = "Types",
+    srcs = [
         "ModArithAttributes.cpp",
         "ModArithDialect.cpp",
-        "ModArithOps.cpp",
         "ModArithTypes.cpp",
     ],
     hdrs = [
