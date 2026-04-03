@@ -48,7 +48,6 @@ def RNS_ExtractSingleSliceOp : RNS_Op<"extract_single_slice", [Pure, Elementwise
 
 def RNS_PackOp : RNS_Op<"pack", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface, ["inferReturnTypes"]>]> {
   let summary = "Pack multiple ModArith values into one RNS value";
-
   let description = [{
     `rns.pack` converts a list of `mod_arith` values into a single value with
     RNS type.
@@ -66,7 +65,6 @@ def RNS_PackOp : RNS_Op<"pack", [Pure, DeclareOpInterfaceMethods<InferTypeOpInte
     return %packed : !rns
     ```
   }];
-
   let arguments = (ins Variadic<ModArith_ModArithType>:$input);
   let results = (outs RNS:$output);
   let assemblyFormat = "operands attr-dict `:` type($input)";

@@ -54,6 +54,9 @@ RNSType inferExtractSliceReturnTypes(MLIRContext* ctx, Op* op,
       ctx, elementType.getBasisTypes().drop_front(start).take_front(size));
 }
 
+FailureOr<SmallVector<Value>> computeMixedRadixCoeffs(
+    ImplicitLocOpBuilder& b, Value input, const ArrayAttr& qInvProds);
+
 }  // namespace rns
 }  // namespace heir
 }  // namespace mlir
