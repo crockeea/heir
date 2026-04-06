@@ -9,6 +9,21 @@ namespace mlir {
 namespace heir {
 namespace mod_arith {
 
+#include "lib/Dialect/ModArith/IR/ModArithTypeInterfaces.cpp.inc"
+
+Type ModArithType::getStorageType() const { return getModulus().getType(); }
+
+unsigned ModArithType::getNumResidues() const { return 1; }
+
+Type ModArithType::getResidueType(unsigned index) const {
+  if (index != 0) {
+    return Type();
+  }
+  return *this;
+}
+
+bool ModArithType::isCompatibleWith(Type other) const { return other == *this; }
+
 LogicalResult ModArithType::verify(
     ::llvm::function_ref<::mlir::InFlightDiagnostic()> emitError,
     ::mlir::IntegerAttr modulus) {

@@ -21,6 +21,7 @@ cc_library(
         "ModArithAttributes.h",
         "ModArithDialect.h",
         "ModArithOps.h",
+        "ModArithTypeInterfaces.h",
         "ModArithTypes.h",
     ],
     deps = [
@@ -28,6 +29,7 @@ cc_library(
         ":canonicalization_inc_gen",
         ":dialect_inc_gen",
         ":ops_inc_gen",
+        ":type_interfaces_inc_gen",
         ":types_inc_gen",
         "@heir//lib/Dialect/RNS/IR:Dialect",
         "@llvm-project//llvm:Support",
@@ -46,6 +48,7 @@ td_library(
         "ModArithCanonicalization.td",
         "ModArithDialect.td",
         "ModArithOps.td",
+        "ModArithTypeInterfaces.td",
         "ModArithTypes.td",
     ],
     # include from the heir-root to enable fully-qualified include-paths
@@ -78,6 +81,17 @@ add_heir_dialect_library(
     dialect_doc_name = "mod_arith",
     kind = "attribute",
     td_file = "ModArithAttributes.td",
+    deps = [
+        ":td_files",
+    ],
+)
+
+add_heir_dialect_library(
+    name = "type_interfaces_inc_gen",
+    dialect = "ModArith",
+    dialect_doc_name = "mod_arith",
+    kind = "type_interface",
+    td_file = "ModArithTypeInterfaces.td",
     deps = [
         ":td_files",
     ],

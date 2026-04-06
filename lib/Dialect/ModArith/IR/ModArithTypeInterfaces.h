@@ -1,0 +1,9 @@
+#ifndef LIB_DIALECT_MODARITH_IR_MODARITHTYPEINTERFACES_H_
+#define LIB_DIALECT_MODARITH_IR_MODARITHTYPEINTERFACES_H_
+
+#include "lib/Dialect/ModArith/IR/ModArithDialect.h"
+
+#define GET_TYPEDEF_CLASSES
+#include "lib/Dialect/ModArith/IR/ModArithTypeInterfaces.h.inc"
+
+#endif  // LIB_DIALECT_MODARITH_IR_MODARITHTYPEINTERFACES_H_
