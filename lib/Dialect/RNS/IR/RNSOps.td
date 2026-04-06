@@ -31,17 +31,17 @@ def RNS_ExtractSliceOp : RNS_Op<"extract_slice", [Pure, ElementwiseMappable, Dec
 }
 
 def RNS_ExtractSingleSliceOp : RNS_Op<"extract_single_slice", [Pure, ElementwiseMappable, DeclareOpInterfaceMethods<InferTypeOpInterface, ["inferReturnTypes"]>]> {
-  let summary = "Extract one RNS limb as a value over ModArith";
+  let summary = "Extract one RNS limb as the type of the limb";
   let description = [{
     Given an RNS-typed value, extract the basis limb at `index` and return it
-    as the corresponding `mod_arith` type.
+    as the corresponding type.
 
     For shaped inputs, this operation is applied elementwise, preserving the
     input container shape while replacing each RNS element with the selected
     limb.
   }];
   let arguments = (ins RNSLike:$input, IndexAttr:$index);
-  let results = (outs ModArithLike:$output);
+  let results = (outs AnyType:$output);
   let assemblyFormat = "$input attr-dict `:` type($input) `->` type($output)";
   let hasVerifier = 1;
 }
@@ -65,7 +65,7 @@ def RNS_PackOp : RNS_Op<"pack", [Pure, DeclareOpInterfaceMethods<InferTypeOpInte
     return %packed : !rns
     ```
   }];
-  let arguments = (ins Variadic<ModArith_ModArithType>:$input);
+  let arguments = (ins Variadic<AnyType>:$input);
   let results = (outs RNS:$output);
   let assemblyFormat = "operands attr-dict `:` type($input)";
 }
