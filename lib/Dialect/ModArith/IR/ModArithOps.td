@@ -23,16 +23,17 @@ class ModArith_Op<string mnemonic, list<Trait> traits = [Pure]> :
 
 // type conversion operations
 def ModArith_EncapsulateOp : ModArith_Op<"encapsulate", [Pure]> {
-  let summary = "encapsulate an integer into a mod_arith type";
+  let summary = "encapsulate an integer into a modular type";
 
   let description = [{
-    `mod_arith.encapsulate` converts the integer to be of mod_arith or RNS type.
+    `mod_arith.encapsulate` converts an integer to a modular type.
+
+    For RNS container construction, prefer `rns.pack`.
 
     Examples:
     ```
     mod_arith.encapsulate %c0 : i32 -> mod_arith.int<65537 : i32>
     mod_arith.encapsulate %c1 : i64 -> mod_arith.int<65537 : i64>
-    mod_arith.encapsulate %c2 : tensor<4x2xi32> -> tensor<4xrns.rns<mod_arith.int<5 : i32>, mod_arith.int<17 : i32>>>
     ```
   }];
 
@@ -48,19 +49,20 @@ def ModArith_ExtractOp : ModArith_Op<"extract", [Pure]> {
   let summary = "extract the integer stored inside mod_arith type";
 
   let description = [{
-    `mod_arith.extract` extracts the integer inside the mod_arith or RNS type.
+    `mod_arith.extract` extracts the integer inside the modular type.
 
     It is required that the bitwidth of the output (tensor of) integer type is
-    the same as that of the storage type of the input mod_arith (or RNS) type.
+    the same as that of the storage type of the input modular type.
+
+    For RNS structure traversal, prefer `rns.extract_single_slice` or
+    `rns.extract_slice`.
 
     Examples:
     ```
     %m0 = mod_arith.encapsulate %c0 : i32 -> mod_arith.int<65537 : i32>
     %m1 = mod_arith.encapsulate %c1 : i64 -> mod_arith.int<65537 : i64>
-    %m2 = mod_arith.encapsulate %c2 : tensor<4x2xi32> -> tensor<4xrns.rns<mod_arith.int<5 : i32>, mod_arith.int<17 : i32>>>
     %c3 = mod_arith.extract %m0 : mod_arith.int<65537 : i32> -> i32
     %c4 = mod_arith.extract %m1 : mod_arith.int<65537 : i64> -> i64
-    %c5 = mod_arith.extract %m2 : tensor<4xrns.rns<mod_arith.int<5 : i32>, mod_arith.int<17 : i32>>> -> tensor<4x2xi32>
     ```
   }];
 

@@ -113,10 +113,10 @@ func.func @test_rns_vec_syntax(%arg0: !rns_vec, %arg1: !rns_vec) {
   // CHECK: mod_arith.add
   %add = mod_arith.add %arg0, %arg1 : !rns_vec
 
-  // CHECK: mod_arith.extract
-  // CHECK: mod_arith.encapsulate
-  %extract = mod_arith.extract %add : !rns_vec -> !int_vec
-  %encapsulate = mod_arith.encapsulate %extract : !int_vec -> !rns_vec
+  // CHECK: rns.extract_slice
+  // CHECK: rns.extract_single_slice
+  %slice = rns.extract_slice %add {start = 0 : index, size = 2 : index} : !rns_vec -> tensor<5x6x!rns.rns<!Zp, !Zp2>>
+  %limb = rns.extract_single_slice %add {index = 1 : index} : !rns_vec -> tensor<5x6x!Zp2>
 
   return
 }

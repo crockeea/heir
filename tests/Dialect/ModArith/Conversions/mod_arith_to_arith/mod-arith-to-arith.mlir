@@ -2,6 +2,8 @@
 
 !Zp = !mod_arith.int<65537 : i32>
 !Zpv = tensor<4x!Zp>
+!RNS0 = !rns.rns<!mod_arith.int<829 : i11>, !mod_arith.int<101 : i11>, !mod_arith.int<37 : i11>>
+!RNS0v = tensor<4x!RNS0>
 
 // CHECK: @test_lower_encapsulate
 // CHECK-SAME: (%[[LHS:.*]]: [[T:.*]]) -> [[T]] {
@@ -37,6 +39,41 @@ func.func @test_lower_extract_vec(%lhs : !Zpv) -> tensor<4xi32> {
   // CHECK: return %[[LHS]] : [[T]]
   %res = mod_arith.extract %lhs: !Zpv -> tensor<4xi32>
   return %res : tensor<4xi32>
+}
+
+// CHECK: @test_lower_rns_pack
+// CHECK-SAME: (%[[X:.*]]: i11, %[[Y:.*]]: i11, %[[Z:.*]]: i11) -> tensor<3xi11> {
+func.func @test_lower_rns_pack(%x : i11, %y : i11, %z : i11) -> !RNS0 {
+  // CHECK-NOT: rns.pack
+  // CHECK: %[[MX:.*]] = tensor.from_elements %[[X]], %[[Y]], %[[Z]] : tensor<3xi11>
+  // CHECK: return %[[MX]] : tensor<3xi11>
+  %mx = mod_arith.encapsulate %x : i11 -> !mod_arith.int<829 : i11>
+  %my = mod_arith.encapsulate %y : i11 -> !mod_arith.int<101 : i11>
+  %mz = mod_arith.encapsulate %z : i11 -> !mod_arith.int<37 : i11>
+  %res = rns.pack %mx, %my, %mz : !mod_arith.int<829 : i11>, !mod_arith.int<101 : i11>, !mod_arith.int<37 : i11>
+  return %res : !RNS0
+}
+
+// CHECK: @test_lower_rns_extract_single_slice
+// CHECK-SAME: (%[[LHS:.*]]: tensor<3xi11>) -> i11 {
+func.func @test_lower_rns_extract_single_slice(%lhs : !RNS0) -> !mod_arith.int<101 : i11> {
+  // CHECK-NOT: rns.extract_single_slice
+  // CHECK: %[[IDX:.*]] = arith.constant 1 : index
+  // CHECK: %[[EXTRACT:.*]] = tensor.extract %[[LHS]][%[[IDX]]] : tensor<3xi11>
+  // CHECK: return %[[EXTRACT]] : i11
+  %res = rns.extract_single_slice %lhs {index = 1 : index} : !RNS0 -> !mod_arith.int<101 : i11>
+  return %res : !mod_arith.int<101 : i11>
+}
+
+// CHECK: @test_lower_rns_extract_single_slice_vec
+// CHECK-SAME: (%[[LHS:.*]]: tensor<4x3xi11>) -> tensor<4xi11> {
+func.func @test_lower_rns_extract_single_slice_vec(%lhs : !RNS0v) -> tensor<4x!mod_arith.int<101 : i11>> {
+  // CHECK-NOT: rns.extract_single_slice
+  // CHECK: %[[SLICE:.*]] = tensor.extract_slice %[[LHS]]
+  // CHECK: %[[COLLAPSED:.*]] = tensor.collapse_shape %[[SLICE]]
+  // CHECK: return %[[COLLAPSED]] : tensor<4xi11>
+  %res = rns.extract_single_slice %lhs {index = 1 : index} : !RNS0v -> tensor<4x!mod_arith.int<101 : i11>>
+  return %res : tensor<4x!mod_arith.int<101 : i11>>
 }
 
 // CHECK: @test_lower_reduce

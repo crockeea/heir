@@ -8,6 +8,7 @@
 #include "lib/Dialect/ModArith/IR/ModArithDialect.h"
 #include "lib/Dialect/ModArith/IR/ModArithOps.h"
 #include "lib/Dialect/ModArith/IR/ModArithTypes.h"
+#include "lib/Dialect/RNS/IR/RNSOps.h"
 #include "lib/Dialect/RNS/IR/RNSTypes.h"
 #include "lib/Utils/APIntUtils.h"
 #include "lib/Utils/ConversionUtils.h"
@@ -139,6 +140,112 @@ struct ConvertExtract : public OpConversionPattern<ExtractOp> {
       ExtractOp op, OpAdaptor adaptor,
       ConversionPatternRewriter& rewriter) const override {
     rewriter.replaceOp(op, adaptor.getOperands()[0]);
+    return success();
+  }
+};
+
+struct ConvertRNSPack : public OpConversionPattern<rns::PackOp> {
+  ConvertRNSPack(mlir::MLIRContext* context)
+      : OpConversionPattern<rns::PackOp>(context) {}
+
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      rns::PackOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    auto resultType = dyn_cast<RankedTensorType>(
+        getTypeConverter()->convertType(op.getType()));
+    if (!resultType) {
+      return rewriter.notifyMatchFailure(
+          op, "expected packed RNS result to convert to a ranked tensor");
+    }
+
+    auto packed = tensor::FromElementsOp::create(
+        rewriter, op.getLoc(), resultType, adaptor.getInput());
+    rewriter.replaceOp(op, packed.getResult());
+    return success();
+  }
+};
+
+static SmallVector<ReassociationIndices> collapseTrailingUnitDimReassociation(
+    int64_t resultRank) {
+  SmallVector<ReassociationIndices> reassociation;
+  reassociation.reserve(resultRank);
+  for (int64_t i = 0; i < resultRank - 1; ++i) {
+    reassociation.push_back({static_cast<int64_t>(i)});
+  }
+  reassociation.push_back({resultRank - 1, resultRank});
+  return reassociation;
+}
+
+struct ConvertRNSExtractSingleSlice
+    : public OpConversionPattern<rns::ExtractSingleSliceOp> {
+  ConvertRNSExtractSingleSlice(mlir::MLIRContext* context)
+      : OpConversionPattern<rns::ExtractSingleSliceOp>(context) {}
+
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      rns::ExtractSingleSliceOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    auto resultType = getTypeConverter()->convertType(op.getType());
+    if (!resultType) {
+      return rewriter.notifyMatchFailure(
+          op, "failed to convert extract_single_slice result type");
+    }
+
+    auto inputType = dyn_cast<RankedTensorType>(adaptor.getInput().getType());
+    if (!inputType) {
+      return rewriter.notifyMatchFailure(
+          op, "expected converted RNS input to be a ranked tensor");
+    }
+
+    auto index = arith::ConstantIndexOp::create(rewriter, op.getLoc(),
+                                                op.getIndex().getSExtValue());
+
+    if (isa<IntegerType>(resultType)) {
+      auto extracted =
+          tensor::ExtractOp::create(rewriter, op.getLoc(), adaptor.getInput(),
+                                    ValueRange{index.getResult()});
+      rewriter.replaceOp(op, extracted.getResult());
+      return success();
+    }
+
+    auto outputType = dyn_cast<RankedTensorType>(resultType);
+    if (!outputType) {
+      return rewriter.notifyMatchFailure(
+          op,
+          "expected extract_single_slice result to convert to integer or "
+          "ranked tensor");
+    }
+
+    SmallVector<int64_t> sliceShape(outputType.getShape());
+    sliceShape.push_back(1);
+    auto sliceType =
+        RankedTensorType::get(sliceShape, outputType.getElementType());
+
+    SmallVector<OpFoldResult> offsets;
+    SmallVector<OpFoldResult> sizes;
+    SmallVector<OpFoldResult> strides;
+    offsets.reserve(inputType.getRank());
+    sizes.reserve(inputType.getRank());
+    strides.reserve(inputType.getRank());
+    for (int64_t dim = 0; dim < outputType.getRank(); ++dim) {
+      offsets.push_back(rewriter.getIndexAttr(0));
+      sizes.push_back(rewriter.getIndexAttr(outputType.getShape()[dim]));
+      strides.push_back(rewriter.getIndexAttr(1));
+    }
+    offsets.push_back(rewriter.getIndexAttr(op.getIndex().getSExtValue()));
+    sizes.push_back(rewriter.getIndexAttr(1));
+    strides.push_back(rewriter.getIndexAttr(1));
+
+    auto slice = tensor::ExtractSliceOp::create(rewriter, op.getLoc(),
+                                                sliceType, adaptor.getInput(),
+                                                offsets, sizes, strides);
+    auto collapsed = tensor::CollapseShapeOp::create(
+        rewriter, op.getLoc(), outputType, slice,
+        collapseTrailingUnitDimReassociation(outputType.getRank()));
+    rewriter.replaceOp(op, collapsed.getResult());
     return success();
   }
 };
@@ -476,23 +583,26 @@ void ModArithToArith::runOnOperation() {
 
   ConversionTarget target(*context);
   target.addIllegalDialect<ModArithDialect>();
+  target.addIllegalOp<rns::PackOp, rns::ExtractSingleSliceOp>();
   target.addLegalDialect<arith::ArithDialect>();
 
   RewritePatternSet patterns(context);
   rewrites::populateWithGenerated(patterns);
-  patterns.add<
-      ConvertEncapsulate, ConvertExtract, ConvertReduce, ConvertAdd, ConvertSub,
-      ConvertMul, ConvertMac, ConvertModSwitch, ConvertBarrettReduce,
-      ConvertConstant, ConvertAny<>, ConvertAny<affine::AffineForOp>,
-      ConvertAny<affine::AffineYieldOp>, ConvertAny<linalg::GenericOp> >(
-      typeConverter, context);
+  patterns
+      .add<ConvertEncapsulate, ConvertExtract, ConvertRNSPack,
+           ConvertRNSExtractSingleSlice, ConvertReduce, ConvertAdd, ConvertSub,
+           ConvertMul, ConvertMac, ConvertModSwitch, ConvertBarrettReduce,
+           ConvertConstant, ConvertAny<>, ConvertAny<affine::AffineForOp>,
+           ConvertAny<affine::AffineYieldOp>, ConvertAny<linalg::GenericOp> >(
+          typeConverter, context);
 
   addStructuralConversionPatterns(typeConverter, patterns, target);
 
   target.addDynamicallyLegalOp<
       tensor::EmptyOp, tensor::ExtractOp, tensor::InsertOp, tensor::CastOp,
-      affine::AffineForOp, affine::AffineYieldOp, linalg::GenericOp,
-      linalg::YieldOp, tensor::ExtractSliceOp, tensor::InsertSliceOp>(
+      tensor::CollapseShapeOp, tensor::FromElementsOp, affine::AffineForOp,
+      affine::AffineYieldOp, linalg::GenericOp, linalg::YieldOp,
+      tensor::ExtractSliceOp, tensor::InsertSliceOp>(
       [&](auto op) { return typeConverter.isLegal(op); });
 
   ConversionConfig config;
