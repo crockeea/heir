@@ -7,7 +7,6 @@
 
 !rns = !rns.rns<!Zp, !Zp2, !Zp3>
 !rns_vec = tensor<5x6x!rns>
-!int_vec = tensor<5x6x3xi10>
 !Zp_large = !mod_arith.int<2223821 : i32>
 
 // CHECK: @test_arith_syntax
