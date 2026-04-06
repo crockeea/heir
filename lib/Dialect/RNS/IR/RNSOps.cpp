@@ -21,6 +21,16 @@ namespace mlir {
 namespace heir {
 namespace rns {
 
+static Type getExtractedStorageType(Type modArithLikeType) {
+  auto modArithType =
+      cast<mod_arith::ModArithType>(getElementTypeOrSelf(modArithLikeType));
+  Type storageType = modArithType.getModulus().getType();
+  if (auto shapedType = dyn_cast<ShapedType>(modArithLikeType)) {
+    storageType = shapedType.cloneWith(shapedType.getShape(), storageType);
+  }
+  return storageType;
+}
+
 FailureOr<SmallVector<Value>> computeMixedRadixCoeffs(
     ImplicitLocOpBuilder& b, Value input, const ArrayAttr& qInvProds) {
   auto rnsTy = dyn_cast<RNSType>(getElementTypeOrSelf(input.getType()));
@@ -41,7 +51,8 @@ FailureOr<SmallVector<Value>> computeMixedRadixCoeffs(
 
   // The first mixed-radix coefficient is easy
   Value c0Reduced = ExtractSingleSliceOp::create(b, input, b.getIndexAttr(0));
-  Value c0Lifted = mod_arith::ExtractOp::create(b, c0Reduced);
+  Value c0Lifted = mod_arith::ExtractOp::create(
+      b, getExtractedStorageType(c0Reduced.getType()), c0Reduced);
   mrcs.push_back(c0Lifted);
 
   // Subsequent coefficients depend on prior coefficients
@@ -97,7 +108,8 @@ FailureOr<SmallVector<Value>> computeMixedRadixCoeffs(
     Value qInvConst =
         mod_arith::ConstantOp::create(b, limbValueTy, qInvValueAttr);
     ci = mod_arith::MulOp::create(b, ci, qInvConst);
-    Value liftedCi = mod_arith::ExtractOp::create(b, ci);
+    Value liftedCi = mod_arith::ExtractOp::create(
+        b, getExtractedStorageType(ci.getType()), ci);
     mrcs.push_back(liftedCi);
   }
   return mrcs;

@@ -68,6 +68,7 @@ cc_library(
         "RNSTypeInterfaces.h",
     ],
     deps = [
+        ":RNSTypes",
         ":dialect_inc_gen",
         ":type_interfaces_inc_gen",
         ":types_inc_gen",
