@@ -1,7 +1,6 @@
 #ifndef LIB_DIALECT_MODARITH_IR_MODARITHOPS_TD_
 #define LIB_DIALECT_MODARITH_IR_MODARITHOPS_TD_
 
-include "lib/Dialect/RNS/IR/RNSTypes.td"
 include "lib/Dialect/ModArith/IR/ModArithDialect.td"
 include "lib/Dialect/ModArith/IR/ModArithTypes.td"
 include "mlir/IR/BuiltinAttributes.td"
@@ -10,8 +9,11 @@ include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
-def ModArithOrRNS : AnyTypeOf<[ModArith_ModArithType, RNS]>;
-def ModArithOrRNSLike : TypeOrValueSemanticsContainer<ModArithOrRNS, "mod_arith_or_rns-like">;
+def ModQ : ConfinedType<
+    AnyType,
+    [HasPromiseOrImplementsTypeInterface<ModQTypeInterface>]
+  >;
+def ModQLike : TypeOrValueSemanticsContainer<ModQ, "mod_q-like">;
 
 class ModArith_Op<string mnemonic, list<Trait> traits = [Pure]> :
         Op<ModArith_Dialect, mnemonic, traits> {
@@ -37,7 +39,7 @@ def ModArith_EncapsulateOp : ModArith_Op<"encapsulate", [Pure]> {
   let arguments = (ins
     SignlessIntegerLike:$input
   );
-  let results = (outs ModArithOrRNSLike:$output);
+  let results = (outs ModQLike:$output);
   let hasVerifier = 1;
   let assemblyFormat = "operands attr-dict `:` type($input) `->` type($output)";
 }
@@ -63,7 +65,7 @@ def ModArith_ExtractOp : ModArith_Op<"extract", [Pure]> {
   }];
 
   let arguments = (ins
-    ModArithOrRNSLike:$input
+    ModQLike:$input
   );
   let results = (outs SignlessIntegerLike:$output);
   let hasVerifier = 1;
@@ -93,8 +95,8 @@ def ModArith_ModSwitchOp : ModArith_Op<"mod_switch", [Pure]> {
     ```
   }];
 
-  let arguments = (ins ModArithOrRNSLike:$input);
-  let results = (outs ModArithOrRNSLike:$output);
+  let arguments = (ins ModQLike:$input);
+  let results = (outs ModQLike:$output);
   let hasVerifier = 1;
   let assemblyFormat = "$input attr-dict `:` type($input) `to` type($output)";
 }
@@ -143,8 +145,8 @@ def ModArith_ReduceOp : ModArith_Op<"reduce", [Pure, ElementwiseMappable, SameOp
 
 class ModArith_BinaryOp<string mnemonic, list<Trait> traits = []> :
     ModArith_Op<mnemonic, traits # [SameOperandsAndResultType, Pure, ElementwiseMappable]>,
-    Arguments<(ins ModArithOrRNSLike:$lhs, ModArithOrRNSLike:$rhs)>,
-    Results<(outs ModArithOrRNSLike:$output)> {
+    Arguments<(ins ModQLike:$lhs, ModQLike:$rhs)>,
+    Results<(outs ModQLike:$output)> {
   let assemblyFormat ="operands attr-dict `:` type($output)";
 }
 

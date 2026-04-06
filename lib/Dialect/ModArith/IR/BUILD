@@ -54,7 +54,6 @@ td_library(
     # include from the heir-root to enable fully-qualified include-paths
     includes = ["../../../.."],
     deps = [
-        "@heir//lib/Dialect/RNS/IR:td_files",
         "@heir//lib/Utils/DRR",
         "@llvm-project//mlir:ArithOpsTdFiles",
         "@llvm-project//mlir:BuiltinDialectTdFiles",
