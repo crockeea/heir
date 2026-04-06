@@ -4,6 +4,7 @@
 
 #include "lib/Dialect/ModArith/IR/ModArithDialect.h"
 #include "lib/Dialect/ModArith/IR/ModArithTypes.h"
+#include "lib/Dialect/RNS/IR/RNSTypes.h"
 #include "llvm/include/llvm/ADT/APInt.h"                // from @llvm-project
 #include "llvm/include/llvm/ADT/ArrayRef.h"             // from @llvm-project
 #include "llvm/include/llvm/ADT/STLFunctionalExtras.h"  // from @llvm-project
@@ -17,6 +18,7 @@ namespace heir {
 
 using mod_arith::ModArithDialect;
 using mod_arith::ModArithType;
+using mod_arith::ModQTypeInterface;
 
 namespace rns {
 
@@ -50,9 +52,53 @@ struct ModArithRNSBasisTypeInterface
   }
 };
 
+struct RNSModQTypeInterface
+    : public ModQTypeInterface::ExternalModel<RNSModQTypeInterface, RNSType> {
+  Type getStorageType(Type type) const {
+    auto rnsType = mlir::dyn_cast<RNSType>(type);
+    if (!rnsType || rnsType.getBasisTypes().empty()) {
+      return Type();
+    }
+
+    auto firstLimb = mlir::dyn_cast<ModArithType>(rnsType.getBasisTypes()[0]);
+    if (!firstLimb) {
+      return Type();
+    }
+    return firstLimb.getStorageType();
+  }
+
+  unsigned getNumResidues(Type type) const {
+    auto rnsType = mlir::dyn_cast<RNSType>(type);
+    if (!rnsType) {
+      return 0;
+    }
+    return rnsType.getBasisTypes().size();
+  }
+
+  Type getResidueType(Type type, unsigned index) const {
+    auto rnsType = mlir::dyn_cast<RNSType>(type);
+    if (!rnsType || index >= rnsType.getBasisTypes().size()) {
+      return Type();
+    }
+    return rnsType.getBasisTypes()[index];
+  }
+
+  bool isCompatibleWith(Type type, Type other) const {
+    auto rnsType = mlir::dyn_cast<RNSType>(type);
+    auto otherRnsType = mlir::dyn_cast<RNSType>(other);
+    if (!rnsType || !otherRnsType) {
+      return false;
+    }
+    return rnsType.getBasisTypes() == otherRnsType.getBasisTypes();
+  }
+};
+
 void registerExternalRNSTypeInterfaces(DialectRegistry& registry) {
   registry.addExtension(+[](MLIRContext* ctx, ModArithDialect* dialect) {
     ModArithType::attachInterface<ModArithRNSBasisTypeInterface>(*ctx);
+  });
+  registry.addExtension(+[](MLIRContext* ctx, RNSDialect* dialect) {
+    RNSType::attachInterface<RNSModQTypeInterface>(*ctx);
   });
 }
 
