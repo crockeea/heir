@@ -40,36 +40,6 @@ cc_library(
     ],
 )
 
-cc_library(
-    name = "Types",
-    srcs = [
-        "ModArithAttributes.cpp",
-        "ModArithDialect.cpp",
-        "ModArithTypes.cpp",
-    ],
-    hdrs = [
-        "ModArithAttributes.h",
-        "ModArithDialect.h",
-        "ModArithOps.h",
-        "ModArithTypeInterfaces.h",
-        "ModArithTypes.h",
-    ],
-    deps = [
-        ":attributes_inc_gen",
-        ":canonicalization_inc_gen",
-        ":dialect_inc_gen",
-        ":ops_inc_gen",
-        ":type_interfaces_inc_gen",
-        ":types_inc_gen",
-        "@llvm-project//llvm:Support",
-        "@llvm-project//mlir:ArithDialect",
-        "@llvm-project//mlir:CommonFolders",
-        "@llvm-project//mlir:IR",
-        "@llvm-project//mlir:InferTypeOpInterface",
-        "@llvm-project//mlir:Support",
-    ],
-)
-
 td_library(
     name = "td_files",
     srcs = [
