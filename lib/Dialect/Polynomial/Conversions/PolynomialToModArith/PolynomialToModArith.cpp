@@ -21,7 +21,6 @@
 #include "lib/Utils/ConversionUtils.h"
 #include "lib/Utils/Polynomial/Polynomial.h"
 #include "llvm/include/llvm/ADT/STLExtras.h"             // from @llvm-project
-#include "llvm/include/llvm/ADT/TypeSwitch.h"            // from @llvm-project
 #include "llvm/include/llvm/Support/Casting.h"           // from @llvm-project
 #include "llvm/include/llvm/Support/FormatVariadic.h"    // from @llvm-project
 #include "llvm/include/llvm/Support/raw_ostream.h"       // from @llvm-project
@@ -94,6 +93,35 @@ struct CommonConversionInfo {
   RankedTensorType tensorType;
 };
 
+std::optional<ModQTypeInterface> getModularCoefficientType(Type type) {
+  if (auto modType = dyn_cast<ModQTypeInterface>(type)) {
+    return modType;
+  }
+  return std::nullopt;
+}
+
+FailureOr<IntegerType> getCoefficientStorageIntegerType(Type type) {
+  if (auto intType = dyn_cast<IntegerType>(type)) {
+    return intType;
+  }
+  auto modType = getModularCoefficientType(type);
+  if (!modType) {
+    return failure();
+  }
+  return dyn_cast<IntegerType>((*modType).getStorageType());
+}
+
+std::optional<ModArithType> getSingleResidueModArithType(Type type) {
+  auto modType = getModularCoefficientType(type);
+  if (!modType || (*modType).getNumResidues() != 1) {
+    return std::nullopt;
+  }
+  if (auto residueType = dyn_cast<ModArithType>((*modType).getResidueType(0))) {
+    return residueType;
+  }
+  return std::nullopt;
+}
+
 FailureOr<CommonConversionInfo> getCommonConversionInfo(
     Operation* op, const TypeConverter* typeConverter,
     std::optional<Type> polyType = std::nullopt) {
@@ -118,35 +146,28 @@ FailureOr<CommonConversionInfo> getCommonConversionInfo(
   info.coefficientType = info.ringAttr.getCoefficientType();
   info.tensorType = cast<RankedTensorType>(typeConverter->convertType(polyTy));
 
-  FailureOr<Type> res =
-      llvm::TypeSwitch<Type, FailureOr<Type>>(info.coefficientType)
-          .Case<IntegerType>([&](auto intTy) { return intTy; })
-          .Case<ModArithType>(
-              [&](ModArithType intTy) { return intTy.getModulus().getType(); })
-          .Default([&](Type ty) { return failure(); });
-  if (failed(res)) {
+  FailureOr<IntegerType> storageType =
+      getCoefficientStorageIntegerType(info.coefficientType);
+  if (failed(storageType)) {
     assert(false && "unsupported coefficient type");
   }
-  info.coefficientStorageType = res.value();
+  info.coefficientStorageType = *storageType;
   return std::move(info);
 }
 
 Value getConstantCoefficient(Type type, int64_t value,
                              ImplicitLocOpBuilder& builder) {
-  return llvm::TypeSwitch<Type, Value>(type)
-      .Case<IntegerType>([&](auto intTy) {
-        return arith::ConstantOp::create(builder,
-                                         builder.getIntegerAttr(intTy, value));
-      })
-      .Case<ModArithType>([&](ModArithType modTy) {
-        return mod_arith::ConstantOp::create(
-            builder, modTy,
-            IntegerAttr::get(modTy.getModulus().getType(), value));
-      })
-      .Default([&](Type ty) {
-        assert(false && "unsupported coefficient type");
-        return Value();
-      });
+  if (auto intTy = dyn_cast<IntegerType>(type)) {
+    return arith::ConstantOp::create(builder,
+                                     builder.getIntegerAttr(intTy, value));
+  }
+  if (auto modTy = getSingleResidueModArithType(type)) {
+    return mod_arith::ConstantOp::create(
+        builder, *modTy,
+        IntegerAttr::get((*modTy).getModulus().getType(), value));
+  }
+  assert(false && "unsupported coefficient type");
+  return Value();
 }
 
 std::pair<APInt, APInt> extendWidthsToLargest(const APInt& a, const APInt& b) {
@@ -278,8 +299,8 @@ struct ConvertConstant : public OpConversionPattern<ConstantOp> {
       // : i32, then -1 equiv 6 mod 7, but -1 as an i32 is 2147483647 equiv 1
       // mod 7.
       if (auto modArithType =
-              dyn_cast<ModArithType>(typeInfo.coefficientType)) {
-        APInt modulus = modArithType.getModulus().getValue();
+              getSingleResidueModArithType(typeInfo.coefficientType)) {
+        APInt modulus = (*modArithType).getModulus().getValue();
         // APInt srem gives remainder with sign matching the sign of the
         // context argument (here, it's the sign of coeff)
         coeff = coeff.sextOrTrunc(modulus.getBitWidth()).srem(modulus);
@@ -292,27 +313,22 @@ struct ConvertConstant : public OpConversionPattern<ConstantOp> {
       coeffs[idx] = IntegerAttr::get(eltStorageType, coeff.getSExtValue());
     }
 
-    return llvm::TypeSwitch<Type, LogicalResult>(typeInfo.coefficientType)
-        .Case<IntegerType>([&](auto intTy) {
-          rewriter.replaceOpWithNewOp<arith::ConstantOp>(
-              op, DenseElementsAttr::get(typeInfo.tensorType, coeffs));
-          return success();
-        })
-        .Case<ModArithType>([&](ModArithType intTy) {
-          auto intTensorType = RankedTensorType::get(
-              typeInfo.tensorType.getShape(), intTy.getModulus().getType());
-          auto constOp = arith::ConstantOp::create(
-              b, DenseElementsAttr::get(intTensorType, coeffs));
-          rewriter.replaceOpWithNewOp<mod_arith::EncapsulateOp>(
-              op, typeInfo.tensorType, constOp.getResult());
-          return success();
-        })
-        .Default([&](Type ty) {
-          op.emitError("unsupported coefficient type: ") << ty;
-          return rewriter.notifyMatchFailure(op,
-                                             "unsupported coefficient type");
-        });
-    return success();
+    if (isa<IntegerType>(typeInfo.coefficientType)) {
+      rewriter.replaceOpWithNewOp<arith::ConstantOp>(
+          op, DenseElementsAttr::get(typeInfo.tensorType, coeffs));
+      return success();
+    }
+    if (auto modTy = getSingleResidueModArithType(typeInfo.coefficientType)) {
+      auto intTensorType = RankedTensorType::get(
+          typeInfo.tensorType.getShape(), (*modTy).getModulus().getType());
+      auto constOp = arith::ConstantOp::create(
+          b, DenseElementsAttr::get(intTensorType, coeffs));
+      rewriter.replaceOpWithNewOp<mod_arith::EncapsulateOp>(
+          op, typeInfo.tensorType, constOp.getResult());
+      return success();
+    }
+    op.emitError("unsupported coefficient type: ") << typeInfo.coefficientType;
+    return rewriter.notifyMatchFailure(op, "unsupported coefficient type");
   }
 };
 
@@ -340,7 +356,7 @@ struct ConvertMonomial : public OpConversionPattern<MonomialOp> {
                b.getIntegerAttr(typeInfo.coefficientStorageType, 0)));
 
     Value result = tensor.getResult();
-    if (isa<ModArithType>(
+    if (getSingleResidueModArithType(
             typeInfo.polynomialType.getRing().getCoefficientType())) {
       result = mod_arith::EncapsulateOp::create(b, typeInfo.tensorType, tensor)
                    .getResult();
@@ -366,7 +382,7 @@ struct ConvertMulScalar : public OpConversionPattern<MulScalarOp> {
           op, "failed to construct common conversion info");
     auto typeInfo = res.value();
 
-    auto coeffType = dyn_cast<ModArithType>(typeInfo.coefficientType);
+    auto coeffType = getSingleResidueModArithType(typeInfo.coefficientType);
     if (!coeffType) {
       return rewriter.notifyMatchFailure(
           op, "expected coefficient type to be mod_arith type");
@@ -376,7 +392,7 @@ struct ConvertMulScalar : public OpConversionPattern<MulScalarOp> {
     // SplatOp only accepts integer/float inputs, so we can't splat a mod_arith
     // directly.
     auto storageTensorType = RankedTensorType::get(
-        typeInfo.tensorType.getShape(), coeffType.getModulus().getType());
+        typeInfo.tensorType.getShape(), (*coeffType).getModulus().getType());
     auto tensor = tensor::SplatOp::create(
         b,
         mod_arith::ExtractOp::create(b, storageTensorType.getElementType(),
@@ -645,24 +661,20 @@ struct ConvertPolyBinop : public OpConversionPattern<SourceOp> {
     auto typeInfo = res.value();
 
     ImplicitLocOpBuilder b(op.getLoc(), rewriter);
-    return llvm::TypeSwitch<Type, LogicalResult>(typeInfo.coefficientType)
-        .template Case<IntegerType>([&](auto intTy) {
-          auto result =
-              TargetArithOp::create(b, adaptor.getLhs(), adaptor.getRhs());
-          rewriter.replaceOp(op, result);
-          return success();
-        })
-        .template Case<ModArithType>([&](ModArithType intTy) {
-          auto result =
-              TargetModArithOp::create(b, adaptor.getLhs(), adaptor.getRhs());
-          rewriter.replaceOp(op, result);
-          return success();
-        })
-        .Default([&](Type ty) {
-          op.emitError("unsupported coefficient type: ") << ty;
-          return rewriter.notifyMatchFailure(op,
-                                             "unsupported coefficient type");
-        });
+    if (isa<IntegerType>(typeInfo.coefficientType)) {
+      auto result =
+          TargetArithOp::create(b, adaptor.getLhs(), adaptor.getRhs());
+      rewriter.replaceOp(op, result);
+      return success();
+    }
+    if (getSingleResidueModArithType(typeInfo.coefficientType)) {
+      auto result =
+          TargetModArithOp::create(b, adaptor.getLhs(), adaptor.getRhs());
+      rewriter.replaceOp(op, result);
+      return success();
+    }
+    op.emitError("unsupported coefficient type: ") << typeInfo.coefficientType;
+    return rewriter.notifyMatchFailure(op, "unsupported coefficient type");
   }
 };
 
@@ -691,7 +703,7 @@ struct ConvertMul : public OpConversionPattern<MulOp> {
       return rewriter.notifyMatchFailure(
           op, "failed to construct common conversion info");
     auto typeInfo = res.value();
-    auto coeffType = dyn_cast<ModArithType>(typeInfo.coefficientType);
+    auto coeffType = getSingleResidueModArithType(typeInfo.coefficientType);
     if (!coeffType) {
       return rewriter.notifyMatchFailure(
           op, "expected coefficient type to be mod_arith type");
@@ -717,7 +729,7 @@ struct ConvertMul : public OpConversionPattern<MulOp> {
         AffineMap::get(2, 0, {d0 + d1})  // i+j
     };
 
-    auto intStorageType = coeffType.getModulus().getType();
+    auto intStorageType = (*coeffType).getModulus().getType();
     auto storageTensorType =
         RankedTensorType::get(polymulTensorType.getShape(), intStorageType);
     auto tensor = arith::ConstantOp::create(
@@ -855,10 +867,10 @@ func::FuncOp PolynomialToModArith::buildPolynomialModFunc(FunctionType funcType,
   // TODO(#1199): support RNS lowering
   if (auto intTy = dyn_cast<IntegerType>(coeffTy)) {
     coeffTyId = llvm::formatv("i{0}", intTy.getWidth());
-  } else if (auto modTy = dyn_cast<ModArithType>(coeffTy)) {
-    IntegerType intTy = cast<IntegerType>(modTy.getModulus().getType());
+  } else if (auto modTy = getSingleResidueModArithType(coeffTy)) {
+    IntegerType intTy = cast<IntegerType>((*modTy).getModulus().getType());
     SmallString<10> modulusStr;
-    modTy.getModulus().getValue().toStringUnsigned(modulusStr);
+    (*modTy).getModulus().getValue().toStringUnsigned(modulusStr);
     coeffTyId =
         llvm::formatv("{0}_i{1}", modulusStr, intTy.getIntOrFloatBitWidth());
   }
@@ -1278,12 +1290,12 @@ struct ConvertNTT : public OpConversionPattern<NTTOp> {
     RingAttr ring = polyTy.getRing();
     auto inputType = dyn_cast<RankedTensorType>(adaptor.getInput().getType());
     auto coeffType =
-        dyn_cast<ModArithType>(polyTy.getRing().getCoefficientType());
+        getSingleResidueModArithType(polyTy.getRing().getCoefficientType());
     if (!coeffType) {
       return rewriter.notifyMatchFailure(
           op, "expected coefficient type to be mod_arith type");
     }
-    auto coeffStorageType = coeffType.getModulus().getType();
+    auto coeffStorageType = (*coeffType).getModulus().getType();
     auto intTensorType =
         RankedTensorType::get(inputType.getShape(), coeffStorageType);
     auto modType = adaptor.getInput().getType();
@@ -1328,12 +1340,12 @@ struct ConvertINTT : public OpConversionPattern<INTTOp> {
 
     ImplicitLocOpBuilder b(op.getLoc(), rewriter);
 
-    auto coeffType = dyn_cast<ModArithType>(typeInfo.coefficientType);
+    auto coeffType = getSingleResidueModArithType(typeInfo.coefficientType);
     if (!coeffType) {
       return rewriter.notifyMatchFailure(
           op, "expected coefficient type to be mod_arith type");
     }
-    auto coeffStorageType = coeffType.getModulus().getType();
+    auto coeffStorageType = (*coeffType).getModulus().getType();
     auto inputType = dyn_cast<RankedTensorType>(adaptor.getInput().getType());
     auto intTensorType =
         RankedTensorType::get(inputType.getShape(), coeffStorageType);

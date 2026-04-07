@@ -78,40 +78,50 @@ LogicalResult attachNTTRootsGeneric(Operation* op, PatternRewriter& rewriter,
   Type coeffType = ring.getCoefficientType();
   PrimitiveRootAttr rootAttr;
 
-  if (auto modArithType = dyn_cast<mod_arith::ModArithType>(coeffType)) {
-    std::optional<mod_arith::ModArithAttr> root =
-        getModArithRoot(context, modArithType, degree, useInvRoot);
-    if (!root) {
-      return rewriter.notifyMatchFailure(
-          op, "Unable to compute primitive root for ModArith type");
-    }
-    rootAttr = PrimitiveRootAttr::get(context, *root, cycIndex);
-  } else if (auto rnsType = dyn_cast<rns::RNSType>(coeffType)) {
-    SmallVector<Attribute> rootValues;
-    rootValues.reserve(rnsType.getBasisTypes().size());
-    for (Type basisType : rnsType.getBasisTypes()) {
-      auto limbType = dyn_cast<mod_arith::ModArithType>(basisType);
-      if (!limbType) {
-        llvm::raw_string_ostream(msg)
-            << "Expected ModArith component in RNS type; got " << basisType;
-        return rewriter.notifyMatchFailure(op, msg);
-      }
-      std::optional<mod_arith::ModArithAttr> root =
-          getModArithRoot(context, limbType, degree, useInvRoot);
-      if (!root) {
-        return rewriter.notifyMatchFailure(
-            op, "Unable to compute primitive root for RNS type");
-      }
-      rootValues.push_back(*root);
-    }
-    rns::RNSAttr rootValue = rns::RNSAttr::get(context, rootValues, rnsType);
-    rootAttr = PrimitiveRootAttr::get(context, rootValue, cycIndex);
-  } else {
+  auto modularCoeffType = dyn_cast<mod_arith::ModQTypeInterface>(coeffType);
+  if (!modularCoeffType) {
     llvm::raw_string_ostream(msg)
         << "polyMulToNTT cannot create an NTT root for coefficient type "
         << coeffType;
     return rewriter.notifyMatchFailure(op, msg);
   }
+
+  SmallVector<Attribute> rootValues;
+  rootValues.reserve(modularCoeffType.getNumResidues());
+  for (unsigned i = 0; i < modularCoeffType.getNumResidues(); ++i) {
+    auto limbType =
+        dyn_cast<mod_arith::ModArithType>(modularCoeffType.getResidueType(i));
+    if (!limbType) {
+      llvm::raw_string_ostream(msg)
+          << "Expected ModArith residue in coefficient type; got "
+          << modularCoeffType.getResidueType(i);
+      return rewriter.notifyMatchFailure(op, msg);
+    }
+
+    std::optional<mod_arith::ModArithAttr> root =
+        getModArithRoot(context, limbType, degree, useInvRoot);
+    if (!root) {
+      return rewriter.notifyMatchFailure(
+          op, "Unable to compute primitive root for coefficient type");
+    }
+    rootValues.push_back(*root);
+  }
+
+  if (rootValues.size() == 1) {
+    rootAttr = PrimitiveRootAttr::get(
+        context, cast<mod_arith::ModArithAttr>(rootValues.front()), cycIndex);
+  } else {
+    auto rnsType = dyn_cast<rns::RNSType>(coeffType);
+    if (!rnsType) {
+      llvm::raw_string_ostream(msg)
+          << "Expected RNSType for multi-residue coefficient type; got "
+          << coeffType;
+      return rewriter.notifyMatchFailure(op, msg);
+    }
+    rns::RNSAttr rootValue = rns::RNSAttr::get(context, rootValues, rnsType);
+    rootAttr = PrimitiveRootAttr::get(context, rootValue, cycIndex);
+  }
+
   rewriter.modifyOpInPlace(op, [&] { op->setAttr("root", rootAttr); });
   return success();
 }
