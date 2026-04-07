@@ -86,7 +86,7 @@ LogicalResult attachNTTRootsGeneric(Operation* op, PatternRewriter& rewriter,
     return rewriter.notifyMatchFailure(op, msg);
   }
 
-  SmallVector<Attribute> rootValues;
+  SmallVector<mod_arith::ModArithAttr> rootValues;
   rootValues.reserve(modularCoeffType.getNumResidues());
   for (unsigned i = 0; i < modularCoeffType.getNumResidues(); ++i) {
     auto limbType =
@@ -107,20 +107,14 @@ LogicalResult attachNTTRootsGeneric(Operation* op, PatternRewriter& rewriter,
     rootValues.push_back(*root);
   }
 
-  if (rootValues.size() == 1) {
-    rootAttr = PrimitiveRootAttr::get(
-        context, cast<mod_arith::ModArithAttr>(rootValues.front()), cycIndex);
-  } else {
-    auto rnsType = dyn_cast<rns::RNSType>(coeffType);
-    if (!rnsType) {
-      llvm::raw_string_ostream(msg)
-          << "Expected RNSType for multi-residue coefficient type; got "
-          << coeffType;
-      return rewriter.notifyMatchFailure(op, msg);
-    }
-    rns::RNSAttr rootValue = rns::RNSAttr::get(context, rootValues, rnsType);
-    rootAttr = PrimitiveRootAttr::get(context, rootValue, cycIndex);
+  auto rootValue = buildCoefficientAttrFromResidues(
+      coeffType, rootValues, [&]() -> InFlightDiagnostic {
+        return op->emitError() << "failed to build primitive root attr: ";
+      });
+  if (failed(rootValue)) {
+    return failure();
   }
+  rootAttr = PrimitiveRootAttr::get(context, *rootValue, cycIndex);
 
   rewriter.modifyOpInPlace(op, [&] { op->setAttr("root", rootAttr); });
   return success();

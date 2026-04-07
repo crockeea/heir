@@ -22,6 +22,99 @@ namespace mlir {
 namespace heir {
 namespace polynomial {
 
+LogicalResult getCoefficientAttrResidues(
+    Type coefficientType, Attribute value,
+    SmallVectorImpl<mod_arith::ModArithAttr>& residues,
+    llvm::function_ref<InFlightDiagnostic()> emitError) {
+  auto modType = dyn_cast<mod_arith::ModQTypeInterface>(coefficientType);
+  if (!modType) {
+    return emitError() << "unsupported coefficient type " << coefficientType;
+  }
+
+  residues.clear();
+  if (auto modArithValue = dyn_cast<mod_arith::ModArithAttr>(value)) {
+    if (modType.getNumResidues() != 1 ||
+        modArithValue.getType() != modType.getResidueType(0)) {
+      return emitError() << "coefficient type " << coefficientType
+                         << " is incompatible with attribute type "
+                         << modArithValue.getType();
+    }
+    residues.push_back(modArithValue);
+    return success();
+  }
+
+  if (auto rnsValue = dyn_cast<rns::RNSAttr>(value)) {
+    if (rnsValue.getType() != coefficientType) {
+      return emitError() << "coefficient type " << coefficientType
+                         << " is incompatible with attribute type "
+                         << rnsValue.getType();
+    }
+    if (rnsValue.getValues().size() != modType.getNumResidues()) {
+      return emitError()
+             << "attribute residue count does not match coefficient type";
+    }
+
+    residues.reserve(rnsValue.getValues().size());
+    for (Attribute limbAttr : rnsValue.getValues()) {
+      auto modArithLimb = dyn_cast<mod_arith::ModArithAttr>(limbAttr);
+      if (!modArithLimb) {
+        return emitError()
+               << "expected RNS attribute to contain ModArith limb attrs, got "
+               << limbAttr;
+      }
+      residues.push_back(modArithLimb);
+    }
+    return success();
+  }
+
+  if (auto typedAttr = dyn_cast<TypedAttr>(value)) {
+    return emitError() << "unsupported coefficient attribute type "
+                       << typedAttr.getType();
+  }
+  return emitError() << "coefficient attribute must be typed";
+}
+
+FailureOr<Attribute> buildCoefficientAttrFromResidues(
+    Type coefficientType, ArrayRef<mod_arith::ModArithAttr> residues,
+    llvm::function_ref<InFlightDiagnostic()> emitError) {
+  auto modType = dyn_cast<mod_arith::ModQTypeInterface>(coefficientType);
+  if (!modType) {
+    emitError() << "unsupported coefficient type " << coefficientType;
+    return failure();
+  }
+
+  if (residues.size() != modType.getNumResidues()) {
+    emitError() << "coefficient type " << coefficientType << " expects "
+                << modType.getNumResidues() << " residue attrs, but got "
+                << residues.size();
+    return failure();
+  }
+
+  for (unsigned i = 0; i < residues.size(); ++i) {
+    if (residues[i].getType() != modType.getResidueType(i)) {
+      emitError() << "residue attr at index " << i << " has incompatible type "
+                  << residues[i].getType() << " for coefficient type "
+                  << coefficientType;
+      return failure();
+    }
+  }
+
+  if (residues.size() == 1) {
+    return Attribute(residues.front());
+  }
+
+  auto rnsType = dyn_cast<rns::RNSType>(coefficientType);
+  if (!rnsType) {
+    emitError() << "multi-residue coefficient type must be RNSType, got "
+                << coefficientType;
+    return failure();
+  }
+
+  SmallVector<Attribute> rootValues(residues.begin(), residues.end());
+  return Attribute(
+      rns::RNSAttr::get(coefficientType.getContext(), rootValues, rnsType));
+}
+
 void IntPolynomialAttr::print(AsmPrinter& p) const {
   p << '<' << getPolynomial() << '>';
 }

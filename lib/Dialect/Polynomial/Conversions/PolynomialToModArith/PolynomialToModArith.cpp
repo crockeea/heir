@@ -1299,16 +1299,25 @@ struct ConvertNTT : public OpConversionPattern<NTTOp> {
     auto intTensorType =
         RankedTensorType::get(inputType.getShape(), coeffStorageType);
     auto modType = adaptor.getInput().getType();
-    auto rootMAAttr =
-        dyn_cast<mod_arith::ModArithAttr>(op.getRoot().value().getValue());
-    if (!rootMAAttr) {
+    SmallVector<mod_arith::ModArithAttr> rootResidues;
+    if (failed(getCoefficientAttrResidues(
+            polyTy.getRing().getCoefficientType(),
+            op.getRoot().value().getValue(), rootResidues,
+            [&]() -> InFlightDiagnostic {
+              return op->emitError()
+                     << "expected primitive root compatible with coefficient "
+                        "type: ";
+            }))) {
+      return failure();
+    }
+    if (rootResidues.size() != 1) {
       return rewriter.notifyMatchFailure(
-          op, "expected primitive root type to be mod_arith type");
+          op, "expected primitive root for single-residue coefficient type");
     }
 
     // Compute the ntt and extract the values
     Value nttResult = fastNTT<false>(
-        b, ring, rootMAAttr, intTensorType, modType,
+        b, ring, rootResidues.front(), intTensorType, modType,
         computeReverseBitOrder(b, intTensorType, modType, adaptor.getInput()));
 
     auto intResult = tensor::CastOp::create(b, inputType, nttResult);
@@ -1350,17 +1359,25 @@ struct ConvertINTT : public OpConversionPattern<INTTOp> {
     auto intTensorType =
         RankedTensorType::get(inputType.getShape(), coeffStorageType);
     auto modType = typeConverter->convertType(op.getOutput().getType());
-    auto rootMAAttr =
-        dyn_cast<mod_arith::ModArithAttr>(op.getRoot().value().getValue());
-    if (!rootMAAttr) {
+    SmallVector<mod_arith::ModArithAttr> rootResidues;
+    if (failed(getCoefficientAttrResidues(
+            typeInfo.coefficientType, op.getRoot().value().getValue(),
+            rootResidues, [&]() -> InFlightDiagnostic {
+              return op->emitError()
+                     << "expected primitive root compatible with coefficient "
+                        "type: ";
+            }))) {
+      return failure();
+    }
+    if (rootResidues.size() != 1) {
       return rewriter.notifyMatchFailure(
-          op, "expected primitive root type to be mod_arith type");
+          op, "expected primitive root for single-residue coefficient type");
     }
 
     // Remove the encoded ring from input tensor type and convert to mod_arith
     // type
     auto input = tensor::CastOp::create(b, modType, adaptor.getInput());
-    auto nttResult = fastNTT<true>(b, typeInfo.ringAttr, rootMAAttr,
+    auto nttResult = fastNTT<true>(b, typeInfo.ringAttr, rootResidues.front(),
                                    intTensorType, modType, input);
 
     auto reversedBitOrder =
