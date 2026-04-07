@@ -10,7 +10,6 @@
 #include "lib/Dialect/ModArith/IR/ModArithTypes.h"
 #include "lib/Dialect/Polynomial/IR/PolynomialAttributes.h"
 #include "lib/Dialect/Polynomial/IR/PolynomialTypes.h"
-#include "lib/Dialect/RNS/IR/RNSAttributes.h"
 #include "lib/Dialect/RNS/IR/RNSOps.h"
 #include "lib/Dialect/RNS/IR/RNSTypes.h"
 #include "lib/Utils/Polynomial/Polynomial.h"
@@ -251,13 +250,6 @@ static LogicalResult verifyNTTOp(Operation* op, Type inputType, Type outputType,
   if (root.has_value()) {
     Attribute rootValue = root.value().getValue();
     APInt rootDegree = root.value().getDegree().getValue();
-    auto coeffType =
-        dyn_cast<mod_arith::ModQTypeInterface>(inputRing.getCoefficientType());
-    if (!coeffType) {
-      return op->emitOpError() << "Ring has unsupported coefficient type "
-                               << inputRing.getCoefficientType();
-    }
-
     SmallVector<mod_arith::ModArithAttr> rootResidues;
     if (failed(getCoefficientAttrResidues(
             inputRing.getCoefficientType(), rootValue, rootResidues,
@@ -270,22 +262,8 @@ static LogicalResult verifyNTTOp(Operation* op, Type inputType, Type outputType,
       return failure();
     }
 
-    for (unsigned i = 0; i < coeffType.getNumResidues(); ++i) {
-      auto limbType =
-          dyn_cast<mod_arith::ModArithType>(coeffType.getResidueType(i));
-      if (!limbType) {
-        return op->emitOpError() << "Ring has unsupported coefficient type "
-                                 << inputRing.getCoefficientType();
-      }
-
-      mod_arith::ModArithAttr rootLimbValue = rootResidues[i];
-      if (rootLimbValue.getType() != limbType) {
-        return op->emitOpError()
-               << "Ring has coefficient type " << inputRing.getCoefficientType()
-               << ", but primitive root attr had incorrect limb[" << i
-               << "] = " << rootLimbValue;
-      }
-
+    for (mod_arith::ModArithAttr rootLimbValue : rootResidues) {
+      mod_arith::ModArithType limbType = rootLimbValue.getType();
       APInt cmod = limbType.getModulus().getValue();
       APInt residueValue = rootLimbValue.getValue().getValue();
       if (!isPrimitiveNthRootOfUnity(residueValue, rootDegree, cmod)) {

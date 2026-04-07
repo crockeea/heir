@@ -55,12 +55,18 @@ LogicalResult getCoefficientAttrResidues(
     }
 
     residues.reserve(rnsValue.getValues().size());
-    for (Attribute limbAttr : rnsValue.getValues()) {
+    for (const auto& [i, limbAttr] : llvm::enumerate(rnsValue.getValues())) {
       auto modArithLimb = dyn_cast<mod_arith::ModArithAttr>(limbAttr);
       if (!modArithLimb) {
         return emitError()
                << "expected RNS attribute to contain ModArith limb attrs, got "
                << limbAttr;
+      }
+      if (modArithLimb.getType() != modType.getResidueType(i)) {
+        return emitError() << "residue attr at index " << i
+                           << " has incompatible type "
+                           << modArithLimb.getType() << " for coefficient type "
+                           << coefficientType;
       }
       residues.push_back(modArithLimb);
     }
