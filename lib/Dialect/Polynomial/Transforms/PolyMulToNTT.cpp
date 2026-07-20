@@ -19,6 +19,7 @@
 #include "mlir/include/mlir/IR/ValueRange.h"             // from @llvm-project
 #include "mlir/include/mlir/Support/LLVM.h"              // from @llvm-project
 #include "mlir/include/mlir/Support/WalkResult.h"        // from @llvm-project
+#include "mlir/include/mlir/Transforms/GreedyPatternRewriteDriver.h"  // from @llvm-project
 
 // IWYU pragma: begin_keep
 #include "mlir/include/mlir/Pass/Pass.h"  // from @llvm-project
@@ -63,8 +64,9 @@ enum class OpFormClass {
 OpFormClass opFormClass(Operation* op) {
   if (isa<func::ReturnOp>(op)) {
     return OpFormClass::RETURN;
-  } else if (isa<ToTensorOp, LeadingTermOp, EvalOp, MonicMonomialMulOp,
-                 FromTensorOp, ApplyCoefficientwiseOp>(op)) {
+  } else if (isa<ToTensorOp, LeadingTermOp, EvalOp, MonomialOp,
+                 MonicMonomialMulOp, FromTensorOp, ApplyCoefficientwiseOp>(
+                 op)) {
     return OpFormClass::COEFF;
   } else if (isa<MulOp>(op)) {
     return OpFormClass::EVAL;
@@ -72,7 +74,7 @@ OpFormClass opFormClass(Operation* op) {
                  tensor::ExtractSliceOp, tensor::ExtractOp,
                  tensor::FromElementsOp>(op)) {
     return OpFormClass::EITHER;
-  } else if (isa<MonomialOp, ConstantOp>(op)) {
+  } else if (isa<ConstantOp>(op)) {
     return OpFormClass::CONST;
   }
   return OpFormClass::UNKNOWN;
@@ -119,6 +121,13 @@ void PolyMulToNTT::runOnOperation() {
   }
 
   IRRewriter rewriter(context);
+  (void)runRegionDCE(rewriter, getOperation()->getRegions());
+  RewritePatternSet canonicalizationPatterns(context);
+  if (failed(
+          applyPatternsGreedily(func, std::move(canonicalizationPatterns)))) {
+    signalPassFailure();
+    return;
+  }
   (void)runRegionDCE(rewriter, getOperation()->getRegions());
 
   // Our goal is to insert as few NTTs + iNTTs as possible while satisyfing all

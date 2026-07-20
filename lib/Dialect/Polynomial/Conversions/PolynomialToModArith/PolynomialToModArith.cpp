@@ -389,6 +389,10 @@ struct ConvertMonomial : public OpConversionPattern<MonomialOp> {
       return rewriter.notifyMatchFailure(
           op, "failed to construct common conversion info");
     auto typeInfo = res.value();
+    if (typeInfo.polynomialType.getForm() != Form::COEFF) {
+      return rewriter.notifyMatchFailure(
+          op, "Monomial lowering requires COEFF form output");
+    }
 
     SmallVector<int64_t> storageShape(typeInfo.tensorType.getShape().begin(),
                                       typeInfo.tensorType.getShape().end());

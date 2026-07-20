@@ -135,6 +135,7 @@ def Polynomial_MulScalarOp : Polynomial_Op<"mul_scalar", [
     PolynomialLike:$output
   );
   let assemblyFormat = "operands attr-dict `:` type($polynomial) `,` type($scalar)";
+  let hasFolder = 1;
   let hasVerifier = 1;
 }
 
@@ -201,6 +202,7 @@ def Polynomial_MonicMonomialMulOp: Polynomial_Op<"monic_monomial_mul", [AllTypes
   }];
   let arguments = (ins PolynomialLike:$input, Index:$monomialDegree);
   let results = (outs PolynomialLike:$output);
+  let hasFolder = 1;
 }
 
 def Polynomial_FromTensorOp : Polynomial_Op<"from_tensor", [Pure]> {

@@ -14,6 +14,7 @@
 !mod_int_poly_ev_ty = !polynomial.polynomial<ring=<coefficientType=!rns_basis_0, polynomialModulus=#ideal4>, form=eval>
 !int_poly_ty = !polynomial.polynomial<ring=<coefficientType=i32, polynomialModulus=#ideal4>>
 !int_poly_ev_ty = !polynomial.polynomial<ring=<coefficientType=i32, polynomialModulus=#ideal>, form=eval>
+!float_poly_ty = !polynomial.polynomial<ring=<coefficientType=f32, polynomialModulus=#ideal4>>
 
 !rns_sliced_basis = !rns.rns<!rns_basis_1>
 !rns_sliced_poly_ty = !polynomial.polynomial<ring=<coefficientType=!rns_sliced_basis, polynomialModulus=#ideal>>
@@ -88,6 +89,28 @@ func.func @test_fold_rns_monomial() -> !rns_poly_ty {
   %coeff = rns.constant <[#mod_arith.value<4 : !rns_basis_0>, #mod_arith.value<5 : !rns_basis_1>]> : !rns_ty
   %0 = polynomial.monomial %coeff, %degree : (!rns_ty, index) -> !rns_poly_ty
   return %0 : !rns_poly_ty
+}
+
+// CHECK: @test_fold_rns_monic_monomial_mul
+func.func @test_fold_rns_monic_monomial_mul() -> !rns_poly_ty {
+  // CHECK-NOT: polynomial.monic_monomial_mul
+  // CHECK: %[[CST:.*]] = polynomial.constant #polynomial<rns_polynomial<dense<{{\[\[}}13, 0{{\]}}, {{\[}}8, 0{{\]\]}}> : tensor<2x2xi32>> : [[TY_RNS_MONIC_MONOMIAL_MUL:![a-zA-Z0-9_]+]]> : [[TY_RNS_MONIC_MONOMIAL_MUL]]
+  // CHECK: return %[[CST]] : [[TY_RNS_MONIC_MONOMIAL_MUL]]
+  %degree = arith.constant 1 : index
+  %0 = polynomial.constant #polynomial.rns_polynomial<dense<[[0, 4], [0, 5]]> : tensor<2x2xi32>> : !rns_poly_ty
+  %1 = polynomial.monic_monomial_mul %0, %degree : (!rns_poly_ty, index) -> !rns_poly_ty
+  return %1 : !rns_poly_ty
+}
+
+// CHECK: @test_fold_rns_mul_scalar
+func.func @test_fold_rns_mul_scalar() -> !rns_poly_ty {
+  // CHECK-NOT: polynomial.mul_scalar
+  // CHECK: %[[CST:.*]] = polynomial.constant #polynomial<rns_polynomial<dense<{{\[\[}}3, 6{{\]}}, {{\[}}2, 4{{\]\]}}> : tensor<2x2xi32>> : [[TY_RNS_MUL_SCALAR:![a-zA-Z0-9_]+]]> : [[TY_RNS_MUL_SCALAR]]
+  // CHECK: return %[[CST]] : [[TY_RNS_MUL_SCALAR]]
+  %scalar = rns.constant <[#mod_arith.value<3 : !rns_basis_0>, #mod_arith.value<7 : !rns_basis_1>]> : !rns_ty
+  %0 = polynomial.constant #polynomial.rns_polynomial<dense<[[1, 2], [4, 8]]> : tensor<2x2xi32>> : !rns_poly_ty
+  %1 = polynomial.mul_scalar %0, %scalar : !rns_poly_ty, !rns_ty
+  return %1 : !rns_poly_ty
 }
 
 // CHECK: @test_fold_rns_ntt
@@ -200,6 +223,28 @@ func.func @test_fold_mod_arith_monomial() -> !mod_poly_ty {
   return %0 : !mod_poly_ty
 }
 
+// CHECK: @test_fold_mod_arith_monic_monomial_mul
+func.func @test_fold_mod_arith_monic_monomial_mul() -> !mod_poly_ty {
+  // CHECK-NOT: polynomial.monic_monomial_mul
+  // CHECK: %[[CST:.*]] = polynomial.constant int<14> : [[TY_MOD_MONIC_MONOMIAL_MUL:![a-zA-Z0-9_]+]]
+  // CHECK: return %[[CST]] : [[TY_MOD_MONIC_MONOMIAL_MUL]]
+  %degree = arith.constant 1 : index
+  %0 = polynomial.constant int<20x> : !mod_poly_ty
+  %1 = polynomial.monic_monomial_mul %0, %degree : (!mod_poly_ty, index) -> !mod_poly_ty
+  return %1 : !mod_poly_ty
+}
+
+// CHECK: @test_fold_mod_arith_mul_scalar
+func.func @test_fold_mod_arith_mul_scalar() -> !mod_poly_ty {
+  // CHECK-NOT: polynomial.mul_scalar
+  // CHECK: %[[CST:.*]] = polynomial.constant int<9 + 8x> : [[TY_MOD_MUL_SCALAR:![a-zA-Z0-9_]+]]
+  // CHECK: return %[[CST]] : [[TY_MOD_MUL_SCALAR]]
+  %scalar = mod_arith.constant 3 : !rns_basis_0
+  %0 = polynomial.constant int<20 + 14x> : !mod_poly_ty
+  %1 = polynomial.mul_scalar %0, %scalar : !mod_poly_ty, !rns_basis_0
+  return %1 : !mod_poly_ty
+}
+
 // CHECK: @test_fold_mod_arith_ntt
 func.func @test_fold_mod_arith_ntt() -> !mod_poly_ev_ty {
   // CHECK-NOT: polynomial.ntt
@@ -266,4 +311,37 @@ func.func @test_fold_int_monomial() -> !int_poly_ty {
   %coeff = arith.constant 4 : i32
   %0 = polynomial.monomial %coeff, %degree : (i32, index) -> !int_poly_ty
   return %0 : !int_poly_ty
+}
+
+// CHECK: @test_fold_int_monic_monomial_mul
+func.func @test_fold_int_monic_monomial_mul() -> !int_poly_ty {
+  // CHECK-NOT: polynomial.monic_monomial_mul
+  // CHECK: %[[CST:.*]] = polynomial.constant int<-2x + x**2> : [[TY_INT_MONIC_MONOMIAL_MUL:![a-zA-Z0-9_]+]]
+  // CHECK: return %[[CST]] : [[TY_INT_MONIC_MONOMIAL_MUL]]
+  %degree = arith.constant 2 : index
+  %0 = polynomial.constant int<1 + 2x**3> : !int_poly_ty
+  %1 = polynomial.monic_monomial_mul %0, %degree : (!int_poly_ty, index) -> !int_poly_ty
+  return %1 : !int_poly_ty
+}
+
+// CHECK: @test_fold_int_mul_scalar
+func.func @test_fold_int_mul_scalar() -> !int_poly_ty {
+  // CHECK-NOT: polynomial.mul_scalar
+  // CHECK: %[[CST:.*]] = polynomial.constant int<3 + 6x**3> : [[TY_INT_MUL_SCALAR:![a-zA-Z0-9_]+]]
+  // CHECK: return %[[CST]] : [[TY_INT_MUL_SCALAR]]
+  %scalar = arith.constant 3 : i32
+  %0 = polynomial.constant int<1 + 2x**3> : !int_poly_ty
+  %1 = polynomial.mul_scalar %0, %scalar : !int_poly_ty, i32
+  return %1 : !int_poly_ty
+}
+
+// CHECK: @test_fold_float_mul_scalar
+func.func @test_fold_float_mul_scalar() -> !float_poly_ty {
+  // CHECK-NOT: polynomial.mul_scalar
+  // CHECK: %[[CST:.*]] = polynomial.constant float<3 + 6x**2> : [[TY_FLOAT_MUL_SCALAR:![a-zA-Z0-9_]+]]
+  // CHECK: return %[[CST]] : [[TY_FLOAT_MUL_SCALAR]]
+  %scalar = arith.constant 3.0 : f32
+  %0 = polynomial.constant float<1.0 + 2.0 x**2> : !float_poly_ty
+  %1 = polynomial.mul_scalar %0, %scalar : !float_poly_ty, f32
+  return %1 : !float_poly_ty
 }
