@@ -1,6 +1,7 @@
 #include "lib/Dialect/Polynomial/Transforms/NTTSolver.h"
 
 #include <cassert>
+#include <cstdint>
 
 #include "lib/Dialect/ModArith/IR/ModArithTypeInterfaces.h"
 #include "lib/Dialect/Polynomial/IR/PolynomialAttributes.h"
@@ -39,8 +40,9 @@ Form CPSATSolution::getMode(const Value& v) const {
 }
 
 bool CPSATSolution::isValid() const {
-  return soln.status() == CpSolverStatus::OPTIMAL ||
-         soln.status() == CpSolverStatus::FEASIBLE;
+  // Only a proven optimum is accepted; a merely FEASIBLE solution may use
+  // more conversions than necessary.
+  return soln.status() == CpSolverStatus::OPTIMAL;
 }
 
 int getConversionCost(const Value& v) {
@@ -68,23 +70,27 @@ NTTSolver::RepVars& NTTSolver::getOrCreateVars(const Value& v) {
   if (it != vars.end()) {
     return it->second;
   }
-  int convCost = getConversionCost(v);
+  int64_t convCost = getConversionCost(v);
+  auto multiplierIt = conversionCostMultiplier.find(v);
+  if (multiplierIt != conversionCostMultiplier.end()) {
+    convCost *= multiplierIt->second;
+  }
   RepVars repVars{/*c=*/model.NewBoolVar(),
                   /*e=*/model.NewBoolVar(),
                   /*conv=*/model.NewBoolVar(),
                   /*mode=*/BoolVar()};
 
-  objective += repVars.conv;
-  // add a new conversion variable equal to the "representative" conversion cost
-  // and force equality between them. We never need references to these other
-  // variables though; we just use repVars.conv as their proxy.
-  for (int i = 1; i < convCost; i++) {
-    BoolVar b = model.NewBoolVar();
-    model.AddEquality(repVars.conv, b);
-    objective += b;
-  }
+  objective += LinearExpr::Term(repVars.conv, convCost);
   vars[v] = repVars;
   return vars[v];
+}
+
+void NTTSolver::setConversionCostMultiplier(const Value& v,
+                                            int64_t multiplier) {
+  assert(multiplier >= 0 && "conversion cost multiplier must be non-negative");
+  assert(!vars.contains(v) &&
+         "conversion cost multiplier must be set before value is modeled");
+  conversionCostMultiplier[v] = multiplier;
 }
 
 const BoolVar& NTTSolver::RepVars::getVarForm(Form form) const {
@@ -139,17 +145,25 @@ void NTTSolver::addConversionCostForForm(const Value& v, Form form) {
   model.AddEquality(vs.conv, form == Form::COEFF ? vs.c : vs.e);
 }
 
-void NTTSolver::addConversionCostIfBothForms(const Value& v) {
-  RepVars& vs = getOrCreateVars(v);
-  // vs.conv <=> vs.c and vs.e (otherwise we just run the op in the mode
-  // required)
+BoolVar NTTSolver::addFloatingMode(llvm::ArrayRef<Value> members) {
+  BoolVar mode = model.NewBoolVar();
+  modeVars.push_back(mode);
+  for (const Value& v : members) {
+    getOrCreateVars(v).mode = mode;
+  }
+  return mode;
+}
 
-  // The first two give vs.conv => vs.c and vs.conv => vs.e, hence vs.conv =>
-  // vs.c ^ vs.e
-  model.AddImplication(vs.conv, vs.c);
-  model.AddImplication(vs.conv, vs.e);
-  // The last is vs.c ^ vs.e => vs.conv
-  model.AddBoolOr({vs.c.Not(), vs.e.Not(), vs.conv});
+void NTTSolver::addModeConversionCost(const Value& member,
+                                      const BoolVar& mode) {
+  RepVars& vs = getOrCreateVars(member);
+  // conv == (mode ^ c) v (!mode ^ e), i.e. a conversion is needed at
+  // member's own materialization site iff member's own demand disagrees
+  // with the group's shared mode.
+  model.AddBoolOr({mode.Not(), vs.c.Not(), vs.conv});  // mode ^ c => conv
+  model.AddBoolOr({mode, vs.e.Not(), vs.conv});        // !mode ^ e => conv
+  model.AddBoolOr({vs.conv.Not(), mode.Not(), vs.c});  // conv ^ mode => c
+  model.AddBoolOr({vs.conv.Not(), mode, vs.e});        // conv ^ !mode => e
 }
 
 void NTTSolver::setZeroConversionCost(const Value& v) {
@@ -168,20 +182,46 @@ void NTTSolver::setZeroConversionCost(const Value& v) {
   objective += vs.e;
 }
 
-void NTTSolver::addOpMode(const Value& v) {
-  RepVars& vs = getOrCreateVars(v);
-  vs.mode = model.NewBoolVar();
-  // 1 = E-mode, 0 = C-mode
-  // If v_e is needed but not v_c, set v_mode = 1
-  // v_e ^ ¬v_c => v_mode
-  model.AddBoolOr({vs.e.Not(), vs.c, vs.mode});
-  // If v_c is needed but not v_e, set v_mode = 0
-  // v_c ^ ¬v_e => v_mode
-  model.AddBoolOr({vs.c.Not(), vs.e, vs.mode.Not()});
-}
-
 CPSATSolution NTTSolver::solve() {
-  model.Minimize(objective);
+  // `objective` is the total number of per-limb NTTs+iNTTs for a fixed
+  // assignment to the set of variables. Multiple assignments can result in the
+  // same objective, making deterministic tests fragile. We *partially* address
+  // this problem by adding a secondary objective `tieBreak` which is the total
+  // number of modes set to EVAL. This ensures that, among all possible
+  // solutions that minimize the primary objective, we pick one which
+  // (arbitrarily) minimizes the number of EVAL modes. `primaryScale` is a
+  // constant (i.e., independent of the mode assignments) which is always larger
+  // than `tieBreak`, therefore `objective * primaryScale + tieBreak` results in
+  // a two-tiered optimization. The tie-break term is at most modeVars.size(),
+  // so scaling the primary objective by modeVars.size() + 1 means saving one
+  // unit of conversion cost always outweighs any change in the tie-break term.
+  //
+  // The current tests all happen to have a unique solution under this
+  // condition, but in general, multiple solutions may still exist. For example:
+  //  - f(a, b) has the same objective cost when exactly one of a/b is EVAL.
+  //      Both solutions also clearly have the same *secondary* objective cost,
+  //      so a non-deterministic solver (either from randomness or from
+  //      multi-threading) or different solver version is free to choose a
+  //      solution different from the one chosen by the current solver.
+  //  - Regions that run zero times (e.g., a loop with a static trip count of 0)
+  //      can include conversions (or not) that don't change the objective,
+  //      since the region never runs, but which changes the IR.
+  //  - Returned constants, which have no conversion cost, can be output in
+  //  either form
+  //  - Zero-length tensors have arbitrary form
+  //
+  // Currently, non-determinism isn't hurting anything, so we finding a robust,
+  // cheap way to produce a globally-unique solution to the CPSAT instance as an
+  // open problem. But if you update the solver version, run this on a very big
+  // machine with lots of cores, or make a seemingly innocuous change in
+  // PolyMulToNTT that shouldn't affect the optimal solution, be aware that the
+  // concrete IR output by this pass can change!
+  LinearExpr tieBreak;
+  for (const BoolVar& mode : modeVars) {
+    tieBreak += mode;
+  }
+  const int64_t primaryScale = static_cast<int64_t>(modeVars.size()) + 1;
+  model.Minimize(objective * primaryScale + tieBreak);
   const CpSolverResponse resp = Solve(model.Build());
   return CPSATSolution(*this, resp);
 }
