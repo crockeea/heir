@@ -68,23 +68,27 @@ NTTSolver::RepVars& NTTSolver::getOrCreateVars(const Value& v) {
   if (it != vars.end()) {
     return it->second;
   }
-  int convCost = getConversionCost(v);
+  int64_t convCost = getConversionCost(v);
+  auto multiplierIt = conversionCostMultiplier.find(v);
+  if (multiplierIt != conversionCostMultiplier.end()) {
+    convCost *= multiplierIt->second;
+  }
   RepVars repVars{/*c=*/model.NewBoolVar(),
                   /*e=*/model.NewBoolVar(),
                   /*conv=*/model.NewBoolVar(),
                   /*mode=*/BoolVar()};
 
-  objective += repVars.conv;
-  // add a new conversion variable equal to the "representative" conversion cost
-  // and force equality between them. We never need references to these other
-  // variables though; we just use repVars.conv as their proxy.
-  for (int i = 1; i < convCost; i++) {
-    BoolVar b = model.NewBoolVar();
-    model.AddEquality(repVars.conv, b);
-    objective += b;
-  }
+  objective += LinearExpr::Term(repVars.conv, convCost);
   vars[v] = repVars;
   return vars[v];
+}
+
+void NTTSolver::setConversionCostMultiplier(const Value& v,
+                                            int64_t multiplier) {
+  assert(multiplier >= 1 && "conversion cost multiplier must be positive");
+  assert(!vars.contains(v) &&
+         "conversion cost multiplier must be set before value is modeled");
+  conversionCostMultiplier[v] = multiplier;
 }
 
 const BoolVar& NTTSolver::RepVars::getVarForm(Form form) const {
@@ -139,17 +143,24 @@ void NTTSolver::addConversionCostForForm(const Value& v, Form form) {
   model.AddEquality(vs.conv, form == Form::COEFF ? vs.c : vs.e);
 }
 
-void NTTSolver::addConversionCostIfBothForms(const Value& v) {
-  RepVars& vs = getOrCreateVars(v);
-  // vs.conv <=> vs.c and vs.e (otherwise we just run the op in the mode
-  // required)
+BoolVar NTTSolver::addFloatingMode(llvm::ArrayRef<Value> members) {
+  BoolVar mode = model.NewBoolVar();
+  for (const Value& v : members) {
+    getOrCreateVars(v).mode = mode;
+  }
+  return mode;
+}
 
-  // The first two give vs.conv => vs.c and vs.conv => vs.e, hence vs.conv =>
-  // vs.c ^ vs.e
-  model.AddImplication(vs.conv, vs.c);
-  model.AddImplication(vs.conv, vs.e);
-  // The last is vs.c ^ vs.e => vs.conv
-  model.AddBoolOr({vs.c.Not(), vs.e.Not(), vs.conv});
+void NTTSolver::addModeConversionCost(const Value& member,
+                                      const BoolVar& mode) {
+  RepVars& vs = getOrCreateVars(member);
+  // conv == (mode ^ c) v (!mode ^ e), i.e. a conversion is needed at
+  // member's own materialization site iff member's own demand disagrees
+  // with the group's shared mode.
+  model.AddBoolOr({mode.Not(), vs.c.Not(), vs.conv});  // mode ^ c => conv
+  model.AddBoolOr({mode, vs.e.Not(), vs.conv});        // !mode ^ e => conv
+  model.AddBoolOr({vs.conv.Not(), mode.Not(), vs.c});  // conv ^ mode => c
+  model.AddBoolOr({vs.conv.Not(), mode, vs.e});        // conv ^ !mode => e
 }
 
 void NTTSolver::setZeroConversionCost(const Value& v) {
@@ -166,18 +177,6 @@ void NTTSolver::setZeroConversionCost(const Value& v) {
   //   sets the variable to 0
   objective += vs.c;
   objective += vs.e;
-}
-
-void NTTSolver::addOpMode(const Value& v) {
-  RepVars& vs = getOrCreateVars(v);
-  vs.mode = model.NewBoolVar();
-  // 1 = E-mode, 0 = C-mode
-  // If v_e is needed but not v_c, set v_mode = 1
-  // v_e ^ ¬v_c => v_mode
-  model.AddBoolOr({vs.e.Not(), vs.c, vs.mode});
-  // If v_c is needed but not v_e, set v_mode = 0
-  // v_c ^ ¬v_e => v_mode
-  model.AddBoolOr({vs.c.Not(), vs.e, vs.mode.Not()});
 }
 
 CPSATSolution NTTSolver::solve() {

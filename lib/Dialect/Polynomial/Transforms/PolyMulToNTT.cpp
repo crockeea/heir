@@ -26,10 +26,13 @@
 #include "mlir/include/mlir/Pass/Pass.h"  // from @llvm-project
 // IWYU pragma: end_keep
 #include "mlir/include/mlir/Transforms/RegionUtils.h"  // from @llvm-project
+#include "ortools/sat/cp_model.h"  // from @com_google_ortools
 
 namespace mlir {
 namespace heir {
 namespace polynomial {
+
+using operations_research::sat::BoolVar;
 
 #define GEN_PASS_DEF_POLYMULTONTT
 #include "lib/Dialect/Polynomial/Transforms/Passes.h.inc"
@@ -203,7 +206,11 @@ void PolyMulToNTT::runOnOperation() {
 
   for (Value arg : func.getArguments()) {
     if (isPolyValue(arg)) {
-      solver.addConversionCostIfBothForms(arg);
+      // Function arguments have no producing op to dictate a native form, so
+      // they get the same singleton floating-mode treatment as an EITHER-class
+      // op's output (see below).
+      BoolVar mode = solver.addFloatingMode({arg});
+      solver.addModeConversionCost(arg, mode);
     }
   }
 
@@ -273,18 +280,15 @@ void PolyMulToNTT::runOnOperation() {
     else if (opClass == OpFormClass::EITHER) {
       Value y = polyResults[0];
       // Since the value output by this op can be in either form, it gets a
-      // 'mode' variable. In short, if y_c is needed and y_e is not, we run the
-      // op in coeff mode, and vice versa.
-      solver.addOpMode(y);
+      // 'mode' variable, shared with nothing else (a singleton floating
+      // group): the op's inputs must match whatever mode the objective picks
+      // for y, and a conversion is charged at y's own site iff y's demand
+      // disagrees with that mode.
+      BoolVar mode = solver.addFloatingMode({y});
       for (Value x : polyOperands) {
-        // if y_mode = 0 and output (in either form) is needed, the inputs in
-        // coeff form are required if y_mode = 1 and output (in either form) is
-        // needed, the inputs in eval form are required
         solver.implyMode(y, x);
       }
-      // The only time there's a conversion cost is if both forms are needed. If
-      // only one form is needed, the op runs in that mode.
-      solver.addConversionCostIfBothForms(y);
+      solver.addModeConversionCost(y, mode);
     }
     // Ops that produce polynomials in any form. We can pre-compute these
     // constants in either (or both!) form(s)
@@ -366,12 +370,11 @@ void PolyMulToNTT::runOnOperation() {
       continue;
     }
 
-    // If the function naturally needs both forms of an input, we have to
-    // arbitrarily pick one to be in the signature. Here, we say "if the
-    // coefficient form of this input is needed, put that in the signature".
-    // If the eval form is *also* needed, we'll obtain it via an NTT of the
-    // input.
-    Form f = soln.needsForm(arg, Form::COEFF) ? Form::COEFF : Form::EVAL;
+    // The argument's materialized form is whatever the solver's (freely
+    // floating) mode picked for it -- see the addFloatingMode call in Step 1.
+    // If the other form is *also* needed, we obtain it via a conversion right
+    // here at the argument's definition site.
+    Form f = soln.getMode(arg);
     Type newTy = typeToForm(arg.getType(), f);
     if (!newTy) {
       signalPassFailure();
@@ -381,17 +384,15 @@ void PolyMulToNTT::runOnOperation() {
     // set the type of the argument SSA value
     arg.setType(newTy);
     if (f == Form::COEFF) {
-      // The coeff-form of this value is the argument itself
       coeffFormCache[arg] = arg;
-      // if the solution also requires the eval form, add an NTT
-      // and cache the result
       if (soln.needsForm(arg, Form::EVAL)) {
         evalFormCache[arg] = addConversion(arg, Form::EVAL);
       }
     } else {
       evalFormCache[arg] = arg;
-      // because of our arbitrary choice above, we know that coeff form is NOT
-      // required
+      if (soln.needsForm(arg, Form::COEFF)) {
+        coeffFormCache[arg] = addConversion(arg, Form::COEFF);
+      }
     }
   }
 
@@ -468,13 +469,15 @@ void PolyMulToNTT::runOnOperation() {
     // "uni-form"
     else if (opClass == OpFormClass::EITHER) {
       Value v = polyResults[0];
-      if (soln.needsConversion(v) !=
-          (soln.needsForm(v, Form::COEFF) && soln.needsForm(v, Form::EVAL))) {
+      bool modeMismatch =
+          (soln.getMode(v) == Form::EVAL && soln.needsForm(v, Form::COEFF)) ||
+          (soln.getMode(v) == Form::COEFF && soln.needsForm(v, Form::EVAL));
+      if (soln.needsConversion(v) != modeMismatch) {
         // Sanity check: This is explicitly encoded into the CP-SAT instance, so
         // it should always be satisfied
         op->emitOpError(
-            "Walk 2: CP-SAT soln mandates coeff form output or conversion for "
-            "eval-form output, but not both");
+            "Walk 2: CP-SAT soln mandates a conversion iff v's own demand "
+            "disagrees with its mode");
         signalPassFailure();
         return;
       }

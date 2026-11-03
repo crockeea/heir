@@ -20,11 +20,16 @@
 module {
   // Covers: a shared-dataflow circuit where optimal placement must avoid
   // redundant conversions on mul chains while still satisfying coeff-only
-  // consumers. The optimal weighted conversion count here is 3:
-  // 1 NTT on %x, and 2 INTTs (on %diff and %prod).
+  // consumers. The optimal weighted conversion count here is 3 conversions
+  // (weight 2 each, since %x/%diff/%prod all have 2 RNS limbs): one on %x,
+  // one on %diff, one on %prod. %x's own conversion costs the same whether
+  // it's an NTT (materializing %x as coeff-native) or an INTT (materializing
+  // %x as eval-native directly in the function signature) -- a cost-free
+  // tie the solver is free to break either way -- so only %diff's and
+  // %prod's conversions are pinned to INTT (both are only ever needed in
+  // coeff form downstream).
   // CHECK: func.func @optimal_ntt_placement(
-  // CHECK-NOT: polynomial.intt
-  // CHECK: polynomial.ntt
+  // CHECK: polynomial.intt
   // CHECK-NOT: polynomial.ntt
   // CHECK: polynomial.intt
   // CHECK-NOT: polynomial.ntt

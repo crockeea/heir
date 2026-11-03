@@ -1,7 +1,10 @@
 #ifndef LIB_DIALECT_POLYNOMIAL_TRANSFORMS_NTT_SOLVER_H_
 #define LIB_DIALECT_POLYNOMIAL_TRANSFORMS_NTT_SOLVER_H_
 
+#include <cstdint>
+
 #include "lib/Dialect/Polynomial/IR/PolynomialAttributes.h"
+#include "llvm/include/llvm/ADT/ArrayRef.h"  // from @llvm-project
 #include "llvm/include/llvm/ADT/DenseMap.h"  // from @llvm-project
 #include "mlir/include/mlir/IR/Value.h"      // from @llvm-project
 #include "ortools/sat/cp_model.h"            // from @com_google_ortools
@@ -31,19 +34,46 @@ class NTTSolver {
   RepVars& getOrCreateVars(const Value& v);
   operations_research::sat::CpModelBuilder model;
   llvm::DenseMap<Value, RepVars> vars;
+  llvm::DenseMap<Value, int64_t> conversionCostMultiplier;
   operations_research::sat::LinearExpr objective;
 
  public:
+  // Scales v's conversion cost in the objective by `multiplier` (e.g. the
+  // number of times a loop containing v's conversion site will execute).
+  // Must be called before any other solver method touches v.
+  void setConversionCostMultiplier(const Value& v, int64_t multiplier);
   void forceDemandEitherForm(const Value& v);
   void forceDemandFixedForm(const Value& v, Form form);
   void implyForm(const Value& v, Form a, Form b);
   void implyUse(const Value& out, const Value& in, Form form);
+  // `out`'s mode (0 = COEFF, 1 = EVAL) determines which form `in` must supply,
+  // gated on `out` being used in some form at all (if `out` is dead, nothing
+  // is forced on `in`). Also used to tie a region-branch successor input's
+  // shared mode (see addFloatingMode) to the operand forwarding into it.
   void implyMode(const Value& out, const Value& in);
   void prohibitBothForms(const Value& v);
   void addConversionCostForForm(const Value& v, Form form);
-  void addConversionCostIfBothForms(const Value& v);
+  // Allocates one fresh mode variable (0 = COEFF, 1 = EVAL) shared by every
+  // value in `members`, and returns it. The mode is left fully free -- driven
+  // only by the objective via addModeConversionCost -- since any value in
+  // `members` may have its own, independently-forced demand that the shared
+  // mode has to reconcile rather than dictate. For a single-output "either
+  // form" op, call this with a one-element list; for a region-branch
+  // successor-input group (e.g. a loop's iter_arg and its result, which MLIR
+  // requires to share one materialized type), call it with every member of
+  // that group.
+  operations_research::sat::BoolVar addFloatingMode(
+      llvm::ArrayRef<Value> members);
+  // Charges `member`'s conversion variable iff `member`'s own demand
+  // disagrees with the shared `mode`: conv == (mode ∧ c) ∨ (¬mode ∧ e). This
+  // generalizes "conversion needed iff both forms independently demanded" to
+  // the case where `member` shares its native form with other values via
+  // addFloatingMode and may need a conversion even when its own demand is
+  // one-sided, because a different member of the group pulled the shared mode
+  // the other way.
+  void addModeConversionCost(const Value& member,
+                             const operations_research::sat::BoolVar& mode);
   void setZeroConversionCost(const Value& v);
-  void addOpMode(const Value& v);
   CPSATSolution solve();
   friend class CPSATSolution;
 };
