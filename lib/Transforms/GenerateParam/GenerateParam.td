@@ -162,6 +162,7 @@ def GenerateParamCKKS : Pass<"generate-param-ckks"> {
 
   let dependentDialects = [
     "mlir::heir::ckks::CKKSDialect",
+    "mlir::heir::cheddar::CheddarDialect",
   ];
 
   let options = [
@@ -185,6 +186,8 @@ def GenerateParamCKKS : Pass<"generate-param-ckks"> {
     Option<"reducedError", "reduced-error", "bool",
            /*default=*/"false", "If true, uses the prime selection logic in Reduced Error paper "
            "(https://eprint.iacr.org/2020/1118).">,
+    Option<"parameterFile", "parameter-file", "std::string",
+           /*default=*/"\"\"", "Path to a YAML or JSON file containing static CKKS scheme parameters to load instead of generating parameters.">,
   ];
 }
 

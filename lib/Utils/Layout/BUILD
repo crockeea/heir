@@ -58,7 +58,6 @@ cc_library(
         "@llvm-project//mlir:ArithUtils",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:Support",
-        "@llvm-project//mlir:TensorDialect",
     ],
 )
 
@@ -146,6 +145,8 @@ cc_test(
         ":Evaluate",
         ":Utils",
         "@googletest//:gtest_main",
+        "@heir//lib/Utils:MathUtils",
+        "@llvm-project//llvm:Support",
         "@llvm-project//mlir:Analysis",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:Support",

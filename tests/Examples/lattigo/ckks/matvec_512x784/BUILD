@@ -8,15 +8,16 @@ heir_lattigo_lib(
     go_library_name = "matvec512x784",
     heir_opt_flags = [
         "--annotate-module=backend=lattigo scheme=ckks",
-        "--mlir-to-ckks=min-slot-count=1024 greedy-modulus-switch-after-mul=true experimental-disable-loop-unroll=true greedy-level-budget=40 first-mod-bits=55",
+        "--mlir-to-ckks=min-slot-count=1024 greedy-modulus-switch-after-mul=true greedy-level-budget=40 first-mod-bits=55",
         "--scheme-to-lattigo",
     ],
     mlir_src = "@heir//tests/Examples/common:matvec_512x784.mlir",
-    split_preprocessing = False,
+    split_preprocessing = True,
 )
 
 go_test(
     name = "matvec512x784_test",
     srcs = ["matvec_512x784_test.go"],
     embed = [":matvec512x784"],
+    deps = [":matvec512x784_utils"],
 )

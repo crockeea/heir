@@ -20,9 +20,9 @@ enum RLWEScheme { ckksScheme, bgvScheme, bfvScheme };
 enum CiphertextManagementStyle { greedy, orbitIlp };
 
 struct LoopOptions : public PassPipelineOptions<LoopOptions> {
-  PassOptions::Option<bool> experimentalDisableLoopUnroll{
-      *this, "experimental-disable-loop-unroll",
-      llvm::cl::desc("Experimental: disable loop unroll, may break analyses "
+  PassOptions::Option<bool> unrollFheKernelLoops{
+      *this, "unroll-fhe-kernel-loops",
+      llvm::cl::desc("Unroll FHE kernel loops "
                      "(default to false)"),
       llvm::cl::init(false)};
 };
@@ -73,10 +73,23 @@ struct MlirToRLWEPipelineOptions : public LoopOptions {
       *this, "scaling-mod-bits",
       llvm::cl::desc("The number of bits in the scaling modulus for CKKS"),
       llvm::cl::init(45)};
+  PassOptions::Option<std::string> parameterFile{
+      *this, "parameter-file",
+      llvm::cl::desc(
+          "Path to a YAML or JSON file containing static CKKS scheme "
+          "parameters"),
+      llvm::cl::init("")};
   PassOptions::Option<int> bfvModBits{
       *this, "bfv-mod-bits",
       llvm::cl::desc("The number of bits for all moduli for B/FV"),
       llvm::cl::init(60)};
+  PassOptions::Option<bool> useCompositeRelu{
+      *this, "use-composite-relu",
+      llvm::cl::desc("Approximate ReLU with the composite-sign method "
+                     "(x*step(x/B), 3 chained minimax Chebyshev polys) "
+                     "instead of a single-polynomial max(x,0) fit. More "
+                     "accurate for deep nets; needs more depth/bootstrapping."),
+      llvm::cl::init(false)};
   PassOptions::Option<bool> debug{
       *this, "debug",
       llvm::cl::desc("Insert debug ports after every secret operation."),
@@ -184,6 +197,10 @@ struct PlaintextBackendOptions
       llvm::cl::desc("The size of the plaintexts; i.e., the number of slots "
                      "to use for packing."),
       llvm::cl::init(1024)};
+  PassOptions::Option<bool> unrollFheKernelLoops{
+      *this, "unroll-fhe-kernel-loops",
+      llvm::cl::desc("Unroll FHE kernel loops (default to false)"),
+      llvm::cl::init(false)};
 };
 
 struct BackendOptions : public PassPipelineOptions<BackendOptions> {

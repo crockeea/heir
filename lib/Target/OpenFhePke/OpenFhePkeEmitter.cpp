@@ -33,6 +33,7 @@
 #include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/Func/IR/FuncOps.h"   // from @llvm-project
+#include "mlir/include/mlir/Dialect/Math/IR/Math.h"      // from @llvm-project
 #include "mlir/include/mlir/Dialect/MemRef/IR/MemRef.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/SCF/IR/SCF.h"        // from @llvm-project
 #include "mlir/include/mlir/Dialect/Tensor/IR/Tensor.h"  // from @llvm-project
@@ -188,6 +189,7 @@ LogicalResult OpenFhePkeEmitter::translate(Operation& op) {
                 arith::DivFOp, arith::CmpIOp, arith::CmpFOp, arith::SelectOp,
                 arith::MaxSIOp, arith::MinSIOp>(
               [&](auto op) { return printOperation(op); })
+          .Case<math::SqrtOp>([&](auto op) { return printOperation(op); })
           // SCF ops
           .Case<scf::IfOp, scf::ForOp, scf::ForallOp, scf::InParallelOp,
                 scf::YieldOp>([&](auto op) { return printOperation(op); })
@@ -210,10 +212,10 @@ LogicalResult OpenFhePkeEmitter::translate(Operation& op) {
               [&](auto op) { return printOperation(op); })
           // OpenFHE ops
           .Case<AddInPlaceOp, AddOp, AddPlainInPlaceOp, AddPlainOp, AutomorphOp,
-                BootstrapOp, DecryptOp, EncryptOp, FastRotationOp,
-                FastRotationExtOp, FastRotationPrecomputeOp, GenBootstrapKeyOp,
-                GenContextOp, GenMulKeyOp, GenParamsOp, GenRotKeyOp,
-                KeySwitchDownOp, KeySwitchInPlaceOp, KeySwitchOp,
+                BootstrapOp, DecryptOp, EncryptOp, EvalChebyshevSeriesOp,
+                FastRotationOp, FastRotationExtOp, FastRotationPrecomputeOp,
+                GenBootstrapKeyOp, GenContextOp, GenMulKeyOp, GenParamsOp,
+                GenRotKeyOp, KeySwitchDownOp, KeySwitchInPlaceOp, KeySwitchOp,
                 LevelReduceInPlaceOp, LevelReduceOp, MakeCKKSPackedPlaintextOp,
                 MakePackedPlaintextOp, ModReduceInPlaceOp, ModReduceOp,
                 MulConstInPlaceOp, MulConstOp, MulNoRelinOp, MulOp, MulPlainOp,
@@ -233,18 +235,12 @@ LogicalResult OpenFhePkeEmitter::translate(Operation& op) {
 }
 
 LogicalResult OpenFhePkeEmitter::printOperation(ModuleOp moduleOp) {
-  OpenfheScheme scheme;
-  if (moduleIsBGV(moduleOp)) {
-    scheme = OpenfheScheme::BGV;
-  } else if (moduleIsBFV(moduleOp)) {
-    scheme = OpenfheScheme::BFV;
-  } else if (moduleIsCKKS(moduleOp)) {
-    scheme = OpenfheScheme::CKKS;
-  } else {
-    return emitError(moduleOp.getLoc(), "Missing scheme attribute on module");
+  auto scheme = getModuleScheme(moduleOp);
+  if (failed(scheme)) {
+    return failure();
   }
 
-  os << getModulePrelude(scheme, importType_) << "\n";
+  os << getModulePrelude(scheme.value(), importType_) << "\n";
 
   for (Operation& op : moduleOp) {
     if (failed(translate(op))) {
@@ -1133,6 +1129,13 @@ LogicalResult OpenFhePkeEmitter::printOperation(arith::TruncFOp op) {
   return success();
 }
 
+LogicalResult OpenFhePkeEmitter::printOperation(math::SqrtOp op) {
+  emitAutoAssignPrefix(op.getResult());
+  os << "std::sqrt(" << variableNames->getNameForValue(op.getOperand())
+     << ");\n";
+  return success();
+}
+
 LogicalResult OpenFhePkeEmitter::printOperation(arith::ExtFOp op) {
   // OpenFHE has a convention that all inputs to MakeCKKSPackedPlaintext are
   // std::vector<double>, so earlier stages in the pipeline emit typecasts
@@ -1372,6 +1375,9 @@ LogicalResult OpenFhePkeEmitter::printOperation(tensor::ConcatOp op) {
 }
 
 LogicalResult OpenFhePkeEmitter::printOperation(tensor::EmptyOp op) {
+  if (preprocessing::LoadResourceOp::getForDestination(op.getResult()))
+    return success();
+
   // std::vector<std::vector<CiphertextT>> result(size);
   RankedTensorType resultType = op.getResult().getType();
   if (failed(emitType(resultType, op->getLoc()))) {
@@ -1701,8 +1707,10 @@ LogicalResult OpenFhePkeEmitter::printOperation(tensor::FromElementsOp op) {
 
 LogicalResult OpenFhePkeEmitter::printOperation(
     ::mlir::heir::preprocessing::LoadResourceOp op) {
-  auto result = op.getResult();
-  auto type = result.getType();
+  if (op.getDirectory())
+    return op.emitOpError("resource directories are not supported by OpenFHE");
+  Value resource = op.getLoadedResource();
+  Type type = resource.getType();
 
   Type eltType;
   if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
@@ -1723,7 +1731,7 @@ LogicalResult OpenFhePkeEmitter::printOperation(
     size = shapedType.getNumElements();
   }
 
-  std::string varName = variableNames->getNameForValue(result);
+  std::string varName = variableNames->getNameForValue(resource);
 
   os << "static const std::vector<" << cppEltType.value() << "> " << varName
      << " = load_resource<" << cppEltType.value() << ">(\"" << op.getPath()
@@ -1733,6 +1741,8 @@ LogicalResult OpenFhePkeEmitter::printOperation(
 }
 
 LogicalResult OpenFhePkeEmitter::printOperation(memref::AllocOp op) {
+  if (preprocessing::LoadResourceOp::getForDestination(op.getResult()))
+    return success();
   auto type = cast<MemRefType>(op.getType());
   if (!type.hasStaticShape()) {
     return emitError(op.getLoc(), "Only static shapes are supported");
@@ -1965,6 +1975,42 @@ LogicalResult OpenFhePkeEmitter::printOperation(EncryptOp op) {
                          {op.getEncryptionKey(), op.getPlaintext()}, "Encrypt");
 }
 
+LogicalResult OpenFhePkeEmitter::printOperation(EvalChebyshevSeriesOp op) {
+  emitAutoAssignPrefix(op.getResult());
+
+  os << variableNames->getNameForValue(op.getCryptoContext()) << "->"
+     << "EvalChebyshevSeries" << "(";
+  os << variableNames->getNameForValue(op.getCiphertext()) << ", ";
+
+  std::vector<std::string> coefs;
+  for (auto attr : op.getCoefficients()) {
+    if (auto floatAttr = llvm::dyn_cast<FloatAttr>(attr)) {
+      auto valOr = printFloatAttr(floatAttr);
+      if (failed(valOr)) {
+        return op.emitError("Failed to print float attribute in coefficients");
+      }
+      coefs.push_back(valOr.value());
+    } else {
+      return op.emitError("coefficients must be an array of float attributes");
+    }
+  }
+  os << "std::vector<double>{" << llvm::join(coefs, ", ") << "}, ";
+
+  auto lowerOr = printFloatAttr(op.getDomainLowerAttr());
+  if (failed(lowerOr)) {
+    return op.emitError("Failed to print domain_lower");
+  }
+  os << lowerOr.value() << ", ";
+
+  auto upperOr = printFloatAttr(op.getDomainUpperAttr());
+  if (failed(upperOr)) {
+    return op.emitError("Failed to print domain_upper");
+  }
+  os << upperOr.value() << ");\n";
+
+  return success();
+}
+
 LogicalResult OpenFhePkeEmitter::printOperation(DecryptOp op) {
   // Decrypt asks for a pointer to an outparam for the output plaintext
   os << "PlaintextT " << variableNames->getNameForValue(op.getResult())
@@ -2055,8 +2101,10 @@ LogicalResult OpenFhePkeEmitter::printOperation(GenContextOp op) {
   os << contextName << "->Enable(PKE);\n";
   os << contextName << "->Enable(KEYSWITCH);\n";
   os << contextName << "->Enable(LEVELEDSHE);\n";
-  if (op.getSupportFHE()) {
+  if (op.getSupportAdvancedSHE() || op.getSupportFHE()) {
     os << contextName << "->Enable(ADVANCEDSHE);\n";
+  }
+  if (op.getSupportFHE()) {
     os << contextName << "->Enable(FHE);\n";
   }
   return success();

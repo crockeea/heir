@@ -1,8 +1,8 @@
 #ifndef LIB_ANALYSIS_UTILS_H_
 #define LIB_ANALYSIS_UTILS_H_
 
-#include <functional>
-
+#include "llvm/include/llvm/ADT/STLFunctionalExtras.h"  // from @llvm-project
+#include "mlir/include/mlir/Analysis/DataFlow/DeadCodeAnalysis.h"  // from @llvm-project
 #include "mlir/include/mlir/Analysis/DataFlowFramework.h"  // from @llvm-project
 #include "mlir/include/mlir/Interfaces/CallInterfaces.h"   // from @llvm-project
 #include "mlir/include/mlir/Support/LLVM.h"                // from @llvm-project
@@ -10,17 +10,24 @@
 namespace mlir {
 namespace heir {
 
+inline bool isBlockLive(Block* block, DataFlowSolver* solver) {
+  if (!block) return false;
+  if (!solver) return true;
+  auto* pp = solver->getProgramPointBefore(block);
+  auto* live = solver->lookupState<mlir::dataflow::Executable>(pp);
+  return live && live->isLive();
+}
+
 // A generalized version of visitExternalCall that joins all arguments to the
 // func.call op, and then propagates this joined value to all results. This is
 // useful for debug functions where there is a single operand that is not
 // changed by the external call, but can also be useful for some analyses like
 // secretness, where the result of the call is secret if any operand is secret.
 template <typename StateT, typename LatticeT>
-void visitExternalCall(CallOpInterface call,
-                       ArrayRef<const LatticeT*> argumentLattices,
-                       ArrayRef<LatticeT*> resultLattices,
-                       const std::function<void(AnalysisState*, ChangeResult)>&
-                           propagateIfChanged) {
+void visitExternalCall(
+    CallOpInterface call, ArrayRef<const LatticeT*> argumentLattices,
+    ArrayRef<LatticeT*> resultLattices,
+    llvm::function_ref<void(AnalysisState*, ChangeResult)> propagateIfChanged) {
   StateT resultState = StateT();
 
   for (const LatticeT* operand : argumentLattices) {

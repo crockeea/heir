@@ -240,6 +240,125 @@ TEST(UtilsTest, BicyclicLayout3x5Repeated) {
   EXPECT_EQ(packedMatrix, expected);
 }
 
+TEST(UtilsTest, PeriodicReplicationRelation) {
+  int64_t numSlots = 10;
+  int64_t period = 3;
+  IntegerRelation replication =
+      getPeriodicReplicationRelation(/*numCiphertexts=*/1, numSlots, period);
+
+  // Every target slot t is reached exactly from source slot t % period.
+  for (int64_t t = 0; t < numSlots; ++t) {
+    for (int64_t s = 0; s < period; ++s) {
+      EXPECT_EQ(replication.containsPointNoLocal({0, s, 0, t}).has_value(),
+                s == t % period);
+    }
+  }
+
+  // Source slots outside the first period are not in the domain.
+  EXPECT_FALSE(replication.containsPointNoLocal({0, period, 0, period}));
+}
+
+TEST(UtilsTest, BicyclicCtPtDiagonal3x5x7) {
+  MLIRContext context;
+  int64_t numSlots = 105;
+  int64_t stride = 3;
+  int64_t contractionDim = 0;
+  RankedTensorType weightType =
+      RankedTensorType::get({5, 7}, IndexType::get(&context));
+  IntegerRelation relation =
+      getBicyclicDiagonalRelation(weightType, contractionDim, stride, numSlots);
+
+  // Initialize a 5x7 weight matrix
+  std::vector<std::vector<int>> weight(5, std::vector<int>(7));
+  for (int i = 0; i < 5; ++i) {
+    for (int j = 0; j < 7; ++j) {
+      weight[i][j] = i * 10 + j;
+    }
+  }
+
+  std::vector<std::vector<int>> packed =
+      evaluateLayoutOnMatrix(relation, weight);
+
+  // Expect n = 5 rows (diagonals) and numSlots = 105 cols
+  EXPECT_EQ(packed.size(), 5);
+  for (int c = 0; c < 5; ++c) {
+    EXPECT_EQ(packed[c].size(), numSlots);
+    for (int k = 0; k < numSlots; ++k) {
+      // D_c[k] = W[(k + c * stride) mod n, k mod freeSize]
+      // here n = 5, stride = 3, freeSize = 7
+      int expectedRow = (k + c * 3) % 5;
+      int expectedCol = k % 7;
+      EXPECT_EQ(packed[c][k], weight[expectedRow][expectedCol]);
+    }
+  }
+}
+
+TEST(UtilsTest, BicyclicPtCtDiagonal3x5x7) {
+  MLIRContext context;
+  int64_t numSlots = 105;
+  int64_t stride = 7;
+  int64_t contractionDim = 1;
+  RankedTensorType weightType =
+      RankedTensorType::get({3, 5}, IndexType::get(&context));
+  IntegerRelation relation =
+      getBicyclicDiagonalRelation(weightType, contractionDim, stride, numSlots);
+
+  // Initialize a 3x5 weight matrix
+  std::vector<std::vector<int>> weight(3, std::vector<int>(5));
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 5; ++j) {
+      weight[i][j] = i * 10 + j;
+    }
+  }
+
+  std::vector<std::vector<int>> packed =
+      evaluateLayoutOnMatrix(relation, weight);
+
+  // Expect n = 5 rows (diagonals) and numSlots = 105 cols
+  EXPECT_EQ(packed.size(), 5);
+  for (int c = 0; c < 5; ++c) {
+    EXPECT_EQ(packed[c].size(), numSlots);
+    for (int k = 0; k < numSlots; ++k) {
+      // D_c[k] = W[k mod freeSize, (k + c * stride) mod n]
+      // here n = 5 (dim 1), stride = 7, freeSize = 3 (dim 0)
+      int expectedRow = k % 3;
+      int expectedCol = (k + c * 7) % 5;
+      EXPECT_EQ(packed[c][k], weight[expectedRow][expectedCol]);
+    }
+  }
+}
+
+TEST(UtilsTest, BicyclicDiagonalNonIntegralWrap) {
+  MLIRContext context;
+  int64_t numSlots = 32;
+  int64_t stride = 7;
+  int64_t contractionDim = 1;
+  RankedTensorType weightType =
+      RankedTensorType::get({3, 5}, IndexType::get(&context));
+  IntegerRelation relation =
+      getBicyclicDiagonalRelation(weightType, contractionDim, stride, numSlots);
+
+  std::vector<std::vector<int>> weight(3, std::vector<int>(5));
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 5; ++j) {
+      weight[i][j] = i * 10 + j;
+    }
+  }
+
+  std::vector<std::vector<int>> packed =
+      evaluateLayoutOnMatrix(relation, weight);
+
+  EXPECT_EQ(packed.size(), 5);
+  for (int c = 0; c < 5; ++c) {
+    EXPECT_EQ(packed[c].size(), numSlots);
+    for (int k = 0; k < numSlots; ++k) {
+      int expectedRow = k % 3;
+      int expectedCol = (k + c * 7) % 5;
+      EXPECT_EQ(packed[c][k], weight[expectedRow][expectedCol]);
+    }
+  }
+}
+
 TEST(UtilsTest, TricyclicLayout2x5x7Structure) {
   MLIRContext context;
   // shape h=2, m=5, n=7
@@ -355,6 +474,93 @@ TEST(UtilsTest, IsRelationBicyclicRejectsUnitDim) {
 
   EXPECT_FALSE(isRelationBicyclic(
       matrixType, numSlots, getBicyclicLayoutRelation(matrixType, numSlots)));
+}
+
+TEST(UtilsTest, GetCyclicLayoutRelationMatchesBicyclicAndTricyclic) {
+  MLIRContext context;
+  int64_t numSlots = 1024;
+
+  RankedTensorType matType =
+      RankedTensorType::get({3, 5}, IndexType::get(&context));
+  EXPECT_TRUE(isRelationEqual(getCyclicLayoutRelation(matType, numSlots),
+                              getBicyclicLayoutRelation(matType, numSlots)));
+
+  RankedTensorType tensorType =
+      RankedTensorType::get({2, 3, 5}, IndexType::get(&context));
+  EXPECT_TRUE(
+      isRelationEqual(getCyclicLayoutRelation(tensorType, numSlots),
+                      getTricyclicLayoutRelation(tensorType, numSlots)));
+}
+
+TEST(UtilsTest, IsRelationCyclicAcceptsValidRanksAndRejectsDegenerate) {
+  MLIRContext context;
+  int64_t numSlots = 1024;
+
+  // 1D valid (rank >= 1 cyclic modulo projection)
+  RankedTensorType t1 = RankedTensorType::get({5}, IndexType::get(&context));
+  EXPECT_TRUE(
+      isRelationCyclic(t1, numSlots, getCyclicLayoutRelation(t1, numSlots)));
+  EXPECT_FALSE(
+      isRelationCyclic(t1, numSlots, getRowMajorLayoutRelation(t1, numSlots)));
+
+  // 2D bicyclic valid
+  RankedTensorType t2 = RankedTensorType::get({3, 5}, IndexType::get(&context));
+  EXPECT_TRUE(
+      isRelationCyclic(t2, numSlots, getCyclicLayoutRelation(t2, numSlots)));
+
+  // 3D tricyclic valid
+  RankedTensorType t3 =
+      RankedTensorType::get({2, 3, 5}, IndexType::get(&context));
+  EXPECT_TRUE(
+      isRelationCyclic(t3, numSlots, getCyclicLayoutRelation(t3, numSlots)));
+
+  // 4D valid (rank-generic cyclic)
+  RankedTensorType t4 =
+      RankedTensorType::get({2, 3, 5, 7}, IndexType::get(&context));
+  EXPECT_TRUE(
+      isRelationCyclic(t4, numSlots, getCyclicLayoutRelation(t4, numSlots)));
+
+  // Rejects unit dimensions (degenerate CRT cycle)
+  RankedTensorType tUnit1d =
+      RankedTensorType::get({1}, IndexType::get(&context));
+  EXPECT_FALSE(isRelationCyclic(tUnit1d, numSlots,
+                                getRowMajorLayoutRelation(tUnit1d, numSlots)));
+
+  RankedTensorType tUnit2d =
+      RankedTensorType::get({1, 5}, IndexType::get(&context));
+  EXPECT_FALSE(isRelationCyclic(tUnit2d, numSlots,
+                                getCyclicLayoutRelation(tUnit2d, numSlots)));
+
+  RankedTensorType tUnit3d =
+      RankedTensorType::get({2, 1, 5}, IndexType::get(&context));
+  EXPECT_FALSE(isRelationCyclic(tUnit3d, numSlots,
+                                getCyclicLayoutRelation(tUnit3d, numSlots)));
+
+  // Rejects 0D (rank < 1)
+  RankedTensorType t0d = RankedTensorType::get({}, IndexType::get(&context));
+  IntegerRelation rel0d(presburger::PresburgerSpace::getRelationSpace(
+      /*numDomain=*/0, /*numRange=*/2, /*numSymbol=*/0, /*numLocals=*/0));
+  EXPECT_FALSE(isRelationCyclic(t0d, numSlots, rel0d));
+
+  // Rejects non-coprime dimensions
+  RankedTensorType tNonCoprime2d =
+      RankedTensorType::get({2, 4}, IndexType::get(&context));
+  EXPECT_FALSE(
+      isRelationCyclic(tNonCoprime2d, numSlots,
+                       getCyclicLayoutRelation(tNonCoprime2d, numSlots)));
+
+  RankedTensorType tNonCoprime3d =
+      RankedTensorType::get({2, 3, 4}, IndexType::get(&context));
+  EXPECT_FALSE(
+      isRelationCyclic(tNonCoprime3d, numSlots,
+                       getCyclicLayoutRelation(tNonCoprime3d, numSlots)));
+
+  // Rejects capacity exceeded
+  RankedTensorType tCapacity =
+      RankedTensorType::get({10, 11}, IndexType::get(&context));
+  EXPECT_FALSE(
+      isRelationCyclic(tCapacity, /*numSlots=*/64,
+                       getCyclicLayoutRelation(tCapacity, /*numSlots=*/64)));
 }
 
 // The pair from TCResNet8's first tensor.collapse_shape (1x40x101 -> 40x101 at
@@ -907,6 +1113,49 @@ TEST(UtilsTest, TestRelationSizeLarge) {
           .value();
   // 50000 * 50000 = 2,500,000,000 (exceeds INT_MAX)
   EXPECT_EQ(relationSize(rel), 2500000000LL);
+}
+
+TEST(UtilsTest, TestGetPaddingRelation) {
+  MLIRContext context;
+  RankedTensorType unpaddedType =
+      RankedTensorType::get({5}, Float32Type::get(&context));
+  RankedTensorType paddedType =
+      RankedTensorType::get({8}, Float32Type::get(&context));
+
+  auto rel = getPaddingRelation(paddedType, unpaddedType, {2});
+
+  // Domain: 0 <= p <= 7
+  // Range: 0 <= s <= 4
+  // Constraint: p - s = 2 => s = p - 2
+
+  // Test some points
+  // Padded index 2 should map to unpadded index 0
+  EXPECT_TRUE(rel.containsPointNoLocal({2, 0}).has_value());
+  // Padded index 6 should map to unpadded index 4
+  EXPECT_TRUE(rel.containsPointNoLocal({6, 4}).has_value());
+
+  // Out of bounds in padded
+  EXPECT_FALSE(rel.containsPointNoLocal({8, 6}).has_value());
+  // Out of bounds in unpadded (even if relation holds)
+  // p = 7 => s = 5, which is out of bounds for unpadded (0 <= s <= 4)
+  EXPECT_FALSE(rel.containsPointNoLocal({7, 5}).has_value());
+  // p = 1 => s = -1, out of bounds
+  EXPECT_FALSE(rel.containsPointNoLocal({1, -1}).has_value());
+}
+
+TEST(UtilsTest, TricyclicCtPtDiagonal2x5x7) {
+  MLIRContext context;
+  int64_t numSlots = 105;
+  int64_t ctStride = 3;
+  int64_t contractionDim = 1;
+  RankedTensorType weightType =
+      RankedTensorType::get({2, 5, 7}, IndexType::get(&context));
+  IntegerRelation relation = getTricyclicDiagonalRelation(
+      weightType, contractionDim, ctStride, numSlots);
+
+  EXPECT_TRUE(relation.containsPointNoLocal({0, 0, 0, 0, 0}).has_value());
+  EXPECT_TRUE(relation.containsPointNoLocal({1, 1, 1, 0, 1}).has_value());
+  EXPECT_FALSE(relation.containsPointNoLocal({0, 0, 0, 0, 1}).has_value());
 }
 
 }  // namespace

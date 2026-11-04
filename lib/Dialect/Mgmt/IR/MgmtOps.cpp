@@ -2,13 +2,24 @@
 
 #include "lib/Dialect/Mgmt/IR/MgmtAttributes.h"
 #include "lib/Dialect/Mgmt/IR/MgmtPatterns.h"
-#include "mlir/include/mlir/IR/MLIRContext.h"   // from @llvm-project
-#include "mlir/include/mlir/IR/Operation.h"     // from @llvm-project
-#include "mlir/include/mlir/IR/PatternMatch.h"  // from @llvm-project
+#include "lib/Target/CompilationTarget/CompilationTarget.h"
+#include "llvm/include/llvm/ADT/STLExtras.h"          // from @llvm-project
+#include "mlir/include/mlir/IR/BuiltinAttributes.h"   // from @llvm-project
+#include "mlir/include/mlir/IR/BuiltinOps.h"          // from @llvm-project
+#include "mlir/include/mlir/IR/MLIRContext.h"         // from @llvm-project
+#include "mlir/include/mlir/IR/Operation.h"           // from @llvm-project
+#include "mlir/include/mlir/IR/PatternMatch.h"        // from @llvm-project
+#include "mlir/include/mlir/Support/LogicalResult.h"  // from @llvm-project
 
 namespace mlir {
 namespace heir {
 namespace mgmt {
+
+static bool cannotEmitAdjustScale(Operation* op) {
+  auto module = op->getParentOfType<ModuleOp>();
+  auto target = getTargetConfig(module);
+  return succeeded(target) && !target->supportsAdjustScale;
+}
 
 //===----------------------------------------------------------------------===//
 // Canonicalization Patterns
@@ -19,6 +30,10 @@ struct ModReduceAfterLevelReduce : public OpRewritePattern<LevelReduceOp> {
 
   LogicalResult matchAndRewrite(LevelReduceOp op,
                                 PatternRewriter& rewriter) const override {
+    // Targets without same-level scale adjustment require rescale to remain
+    // before level reduction. Moving it after level reduction would apply
+    // rescale to the squared scale at the wrong level.
+    if (cannotEmitAdjustScale(op)) return failure();
     auto modReduceOp = op.getInput().getDefiningOp<ModReduceOp>();
     if (!modReduceOp || !modReduceOp->hasOneUse() || !op->hasOneUse())
       return failure();
@@ -31,10 +46,10 @@ struct ModReduceAfterLevelReduce : public OpRewritePattern<LevelReduceOp> {
     auto inputAttr = findMgmtAttrAssociatedWith(input);
 
     auto newLevelReduceOp =
-        rewriter.create<LevelReduceOp>(op.getLoc(), input, levelToDrop);
+        LevelReduceOp::create(rewriter, op.getLoc(), input, levelToDrop);
 
-    auto newModReduceOp =
-        rewriter.create<ModReduceOp>(op.getLoc(), newLevelReduceOp.getResult());
+    auto newModReduceOp = ModReduceOp::create(rewriter, op.getLoc(),
+                                              newLevelReduceOp.getResult());
 
     if (oldLrAttr) {
       setMgmtAttrAssociatedWith(newModReduceOp.getResult(), oldLrAttr);
@@ -76,10 +91,10 @@ struct ModReduceAfterAdjustScale : public OpRewritePattern<AdjustScaleOp> {
     auto inputAttr = findMgmtAttrAssociatedWith(input);
 
     auto newAdjustScaleOp =
-        rewriter.create<AdjustScaleOp>(op.getLoc(), input, id);
+        AdjustScaleOp::create(rewriter, op.getLoc(), input, id);
 
-    auto newModReduceOp =
-        rewriter.create<ModReduceOp>(op.getLoc(), newAdjustScaleOp.getResult());
+    auto newModReduceOp = ModReduceOp::create(rewriter, op.getLoc(),
+                                              newAdjustScaleOp.getResult());
 
     if (oldAsAttr) {
       setMgmtAttrAssociatedWith(newModReduceOp.getResult(), oldAsAttr);
@@ -119,10 +134,10 @@ struct AdjustScaleAfterLevelReduce : public OpRewritePattern<LevelReduceOp> {
     auto inputAttr = findMgmtAttrAssociatedWith(input);
 
     auto newLevelReduceOp =
-        rewriter.create<LevelReduceOp>(op.getLoc(), input, levelToDrop);
+        LevelReduceOp::create(rewriter, op.getLoc(), input, levelToDrop);
 
-    auto newAdjustScaleOp = rewriter.create<AdjustScaleOp>(
-        op.getLoc(), newLevelReduceOp.getResult(), id);
+    auto newAdjustScaleOp = AdjustScaleOp::create(
+        rewriter, op.getLoc(), newLevelReduceOp.getResult(), id);
 
     if (oldLrAttr) {
       setMgmtAttrAssociatedWith(newAdjustScaleOp.getResult(), oldLrAttr);
@@ -154,7 +169,7 @@ struct MergeLevelReduce : public OpRewritePattern<LevelReduceOp> {
     auto oldLr2Attr = findMgmtAttrAssociatedWith(op.getResult());
 
     auto newLr =
-        rewriter.create<LevelReduceOp>(op.getLoc(), input, levelToDrop);
+        LevelReduceOp::create(rewriter, op.getLoc(), input, levelToDrop);
 
     if (oldLr2Attr) {
       setMgmtAttrAssociatedWith(newLr.getResult(), oldLr2Attr);
@@ -170,6 +185,7 @@ struct MergeModReduce : public OpRewritePattern<ModReduceOp> {
 
   LogicalResult matchAndRewrite(ModReduceOp op,
                                 PatternRewriter& rewriter) const override {
+    if (cannotEmitAdjustScale(op)) return failure();
     auto innerMr = op.getInput().getDefiningOp<ModReduceOp>();
     if (!innerMr || !innerMr->hasOneUse()) return failure();
 
@@ -179,10 +195,10 @@ struct MergeModReduce : public OpRewritePattern<ModReduceOp> {
     auto inputAttr = findMgmtAttrAssociatedWith(input);
 
     auto newLevelReduceOp =
-        rewriter.create<LevelReduceOp>(op.getLoc(), input, /*levelToDrop*/ 1);
+        LevelReduceOp::create(rewriter, op.getLoc(), input, /*levelToDrop*/ 1);
 
-    auto newModReduceOp =
-        rewriter.create<ModReduceOp>(op.getLoc(), newLevelReduceOp.getResult());
+    auto newModReduceOp = ModReduceOp::create(rewriter, op.getLoc(),
+                                              newLevelReduceOp.getResult());
 
     if (oldMr2Attr) {
       setMgmtAttrAssociatedWith(newModReduceOp.getResult(), oldMr2Attr);
@@ -213,7 +229,7 @@ struct MergeAdjustScale : public OpRewritePattern<AdjustScaleOp> {
 
     auto oldAs2Attr = findMgmtAttrAssociatedWith(op.getResult());
 
-    auto newAs = rewriter.create<AdjustScaleOp>(op.getLoc(), input, id2);
+    auto newAs = AdjustScaleOp::create(rewriter, op.getLoc(), input, id2);
 
     if (oldAs2Attr) {
       setMgmtAttrAssociatedWith(newAs.getResult(), oldAs2Attr);

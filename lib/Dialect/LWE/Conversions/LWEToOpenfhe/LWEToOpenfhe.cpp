@@ -1,11 +1,13 @@
 #include "lib/Dialect/LWE/Conversions/LWEToOpenfhe/LWEToOpenfhe.h"
 
+#include <cstddef>
 #include <utility>
 
 #include "lib/Dialect/BGV/IR/BGVDialect.h"
 #include "lib/Dialect/BGV/IR/BGVOps.h"
 #include "lib/Dialect/CKKS/IR/CKKSDialect.h"
 #include "lib/Dialect/CKKS/IR/CKKSOps.h"
+#include "lib/Dialect/Kernel/IR/KernelOps.h"
 #include "lib/Dialect/LWE/IR/LWEAttributes.h"
 #include "lib/Dialect/LWE/IR/LWEDialect.h"
 #include "lib/Dialect/LWE/IR/LWEOps.h"
@@ -21,6 +23,7 @@
 #include "lib/Utils/Utils.h"
 #include "llvm/include/llvm/ADT/STLExtras.h"             // from @llvm-project
 #include "llvm/include/llvm/ADT/TypeSwitch.h"            // from @llvm-project
+#include "llvm/include/llvm/Support/Casting.h"           // from @llvm-project
 #include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"    // from @llvm-project
 #include "mlir/include/mlir/Dialect/Func/IR/FuncOps.h"   // from @llvm-project
 #include "mlir/include/mlir/IR/Attributes.h"             // from @llvm-project
@@ -78,15 +81,6 @@ FailureOr<Value> getContextualCryptoContext(Operation* op) {
 }
 
 namespace {
-// NOTE: we can not use containsDialect
-// for FuncOp declaration, which does not have a body
-template <typename... Dialects>
-bool containsArgumentOfDialect(func::FuncOp funcOp) {
-  return llvm::any_of(funcOp.getArgumentTypes(), [&](Type argType) {
-    return DialectEqual<Dialects...>()(
-        &getElementTypeOrSelf(argType).getDialect());
-  });
-}
 
 inline bool isDebugPort(StringRef debugPortName) {
   return debugPortName.rfind("__heir_debug") == 0;
@@ -264,8 +258,8 @@ struct ConvertEncodeOp : public OpConversionPattern<lwe::RLWEEncodeOp> {
         // are std::vector<double>, so we need to cast the input to that type.
         auto f64Ty = rewriter.getF64Type();
         auto newTensorTy = RankedTensorType::get(tensorTy.getShape(), f64Ty);
-        input =
-            arith::ExtFOp::create(rewriter, op.getLoc(), newTensorTy, input);
+        input = arith::ExtFOp::create(rewriter, op.getLoc(), newTensorTy, input,
+                                      /*fastmath=*/arith::FastMathFlagsAttr{});
       }
     }
 
@@ -376,43 +370,51 @@ struct ConvertBootstrapOp : public OpConversionPattern<ckks::BootstrapOp> {
   }
 };
 
+struct ConvertKernelEvalChebyshevOp
+    : public OpConversionPattern<kernel::EvalChebyshevOp> {
+  using OpConversionPattern<kernel::EvalChebyshevOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      kernel::EvalChebyshevOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    FailureOr<Value> result = getContextualCryptoContext(op.getOperation());
+    if (failed(result)) return result;
+    Value cryptoContext = result.value();
+
+    Type resultType = getTypeConverter()->convertType(op.getResult().getType());
+
+    auto coefficients = adaptor.getCoefficients();
+    SmallVector<Attribute> newCoeffs;
+    newCoeffs.reserve(coefficients.size());
+    if (!coefficients.empty()) {
+      auto firstAttr = llvm::cast<FloatAttr>(coefficients[0]);
+      double firstVal = firstAttr.getValue().convertToDouble();
+      auto newFirstAttr =
+          rewriter.getFloatAttr(firstAttr.getType(), firstVal * 2.0);
+      newCoeffs.push_back(newFirstAttr);
+      for (size_t i = 1; i < coefficients.size(); ++i) {
+        newCoeffs.push_back(coefficients[i]);
+      }
+    }
+    auto newCoeffsAttr = rewriter.getArrayAttr(newCoeffs);
+
+    auto domainLowerAttr = rewriter.getFloatAttr(rewriter.getF64Type(), -1.0);
+    auto domainUpperAttr = rewriter.getFloatAttr(rewriter.getF64Type(), 1.0);
+
+    rewriter.replaceOpWithNewOp<openfhe::EvalChebyshevSeriesOp>(
+        op, resultType, cryptoContext, adaptor.getInput(), newCoeffsAttr,
+        domainLowerAttr, domainUpperAttr);
+    return success();
+  }
+};
+
 }  // namespace
 
 struct LWEToOpenfhe : public impl::LWEToOpenfheBase<LWEToOpenfhe> {
   // See https://github.com/llvm/llvm-project/pull/127772
-  // During dialect conversion, the attribute of the func::CallOp is not
-  // preserved. We save the dialect attributes of func::CallOp before
-  // conversion and restore them after conversion.
-  //
-  // Note that this is not safe as after conversion the order of func::CallOp
-  // may change. However, this is the best we can do for now as we do not have
-  // a map from the old func::CallOp to the new func::CallOp.
-  SmallVector<SmallVector<NamedAttribute>> funcCallOpDialectAttrs;
-
-  void saveFuncCallOpDialectAttrs() {
-    funcCallOpDialectAttrs.clear();
-    auto* module = getOperation();
-    module->walk([&](func::CallOp callOp) {
-      SmallVector<NamedAttribute> dialectAttrs;
-      for (auto namedAttr : callOp->getDialectAttrs()) {
-        dialectAttrs.push_back(namedAttr);
-      }
-      funcCallOpDialectAttrs.push_back(dialectAttrs);
-    });
-  }
-
-  void restoreFuncCallOpDialectAttrs() {
-    auto* module = getOperation();
-    auto* funcCallOpDialectAttrsIter = funcCallOpDialectAttrs.begin();
-    module->walk([&](func::CallOp callOp) {
-      callOp->setDialectAttrs(*funcCallOpDialectAttrsIter);
-      ++funcCallOpDialectAttrsIter;
-    });
-  }
-
   void runOnOperation() override {
     // Save the dialect attributes of func::CallOp before conversion.
-    saveFuncCallOpDialectAttrs();
+    auto funcCallOpDialectAttrs = saveFuncCallOpDialectAttrs(getOperation());
 
     MLIRContext* context = &getContext();
     auto* module = getOperation();
@@ -423,6 +425,7 @@ struct LWEToOpenfhe : public impl::LWEToOpenfheBase<LWEToOpenfhe> {
     target.addIllegalDialect<bgv::BGVDialect>();
     target.addIllegalDialect<ckks::CKKSDialect>();
     target.addIllegalDialect<lwe::LWEDialect>();
+    target.addIllegalOp<kernel::EvalChebyshevOp>();
     target.addDynamicallyLegalDialect<preprocessing::PreprocessingDialect>(
         [&](Operation* op) { return typeConverter.isLegal(op); });
 
@@ -516,7 +519,9 @@ struct LWEToOpenfhe : public impl::LWEToOpenfheBase<LWEToOpenfhe> {
         lwe::ConvertLevelReduceOp<bgv::LevelReduceOp>,
         lwe::ConvertLevelReduceOp<ckks::LevelReduceOp>,
         // Bootstrap (CKKS only)
-        ConvertBootstrapOp>(typeConverter, context);
+        ConvertBootstrapOp,
+        // Kernel
+        ConvertKernelEvalChebyshevOp>(typeConverter, context);
 
     preprocessing::populatePreprocessingConversions(patterns, typeConverter,
                                                     context);
@@ -536,7 +541,7 @@ struct LWEToOpenfhe : public impl::LWEToOpenfheBase<LWEToOpenfhe> {
     }
 
     // Restore the dialect attributes of func::CallOp after conversion.
-    restoreFuncCallOpDialectAttrs();
+    restoreFuncCallOpDialectAttrs(getOperation(), funcCallOpDialectAttrs);
   }
 };
 

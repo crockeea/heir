@@ -9,13 +9,11 @@
 #include "mlir/include/mlir/Analysis/Presburger/IntegerRelation.h"  // from @llvm-project
 #include "mlir/include/mlir/Analysis/Presburger/PresburgerSpace.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/Arith/Utils/Utils.h"  // from @llvm-project
-#include "mlir/include/mlir/Dialect/Tensor/IR/Tensor.h"   // from @llvm-project
 #include "mlir/include/mlir/IR/BuiltinTypes.h"            // from @llvm-project
 #include "mlir/include/mlir/Support/LLVM.h"               // from @llvm-project
 
 // ISL
 #include "include/isl/ctx.h"  // from @isl
-#include "include/isl/map.h"  // from @isl
 
 namespace mlir {
 namespace heir {
@@ -66,9 +64,21 @@ presburger::IntegerRelation getDiagonalLayoutRelation(
     RankedTensorType matrixType, int64_t minSlotCount);
 
 // Applies a diagonal layout onto a given 2-D matrix layout.
+//
+// The matrix shape is read off `relation`'s own range bounds, which can be
+// tighter than the matrix the kernel is sized from: a trailing row or column
+// that no entry ever reaches lowers the derived bound. Pass `matrixShape` to
+// diagonalize against an explicit {rows, cols} instead, so that the layout and
+// the kernel agree.
 FailureOr<presburger::IntegerRelation> diagonalize2dMatrix(
     presburger::IntegerRelation relation, RankedTensorType originalType,
-    int64_t minSlotCount);
+    int64_t minSlotCount, ArrayRef<int64_t> matrixShape = {});
+
+// Returns an IntegerRelation that represents a canonical cyclic (CRT) layout
+// for a tensor of rank >= 1. The range is (ct, slot) where ct = 0 and
+// for each dimension d: (-i_d + slot) mod dimSize(d) == 0.
+presburger::IntegerRelation getCyclicLayoutRelation(RankedTensorType type,
+                                                    int64_t numSlots);
 
 // Returns an IntegerRelation that represents a bicyclic layout for a matrix.
 // See https://eprint.iacr.org/2024/1762 for details.
@@ -80,10 +90,41 @@ presburger::IntegerRelation getBicyclicLayoutRelation(
 presburger::IntegerRelation getTricyclicLayoutRelation(
     RankedTensorType tensorType, int64_t numSlots);
 
+// Returns the generalized diagonal packing relation for the cleartext
+// operand of a bicyclic matrix multiplication.
+//
+// This layout is specific to the cleartext matrix. It decomposes the matrix
+// into n diagonal vectors (one for each step along the contracting dimension).
+// Each diagonal vector pre-arranges matrix elements to align with a specific
+// rotation of the encrypted operand and match the target output slots. This
+// avoids single-ciphertext capacity limits and removes the coprimality
+// requirement on the cleartext matrix dimensions. It also ensures that the
+// multiplied result directly matches the output bicyclic layout without needing
+// layout conversions. However, it incurs the overhead of eagerly materializing
+// n separate plaintext vectors of size numSlots.
+presburger::IntegerRelation getBicyclicDiagonalRelation(
+    RankedTensorType matrixType, int64_t contractionDim, int64_t stride,
+    int64_t numSlots);
+
+// Returns an IntegerRelation with domain and range space both (ct, slot) that
+// maps each slot s in [0, period) of a ciphertext to every slot s' in [0,
+// numSlots) with s' equiv s (mod period). Excepts numCiphertexts == 1.
+presburger::IntegerRelation getPeriodicReplicationRelation(
+    int64_t numCiphertexts, int64_t numSlots, int64_t period);
+
 // Returns an IntegerRelation that represents a per-row layout for a matrix
 // such that each row of the matrix is in a separate ciphertext.
 presburger::IntegerRelation getPerRowLayoutRelation(RankedTensorType matrixType,
                                                     int64_t minSlotCount);
+
+// Returns the diagonal packing relation for the rank-3 plaintext operand
+// of the batch ciphertext-plaintext matmul:
+//   BatchDiag'(B, c)_k =
+//       B[k mod h][(k + c*h*ctStride) mod n][k mod p]
+// contractionDim specifies the contraction axis (1 for ct-pt, 2 for pt-ct).
+presburger::IntegerRelation getTricyclicDiagonalRelation(
+    RankedTensorType weightType, int64_t contractionDim, int64_t ctStride,
+    int64_t numSlots);
 
 // Returns true if the given relation is a squat diagonal layout for the given
 // matrix type and ciphertext semantic shape.
@@ -113,6 +154,12 @@ presburger::IntegerRelation foldVectorPermutationIntoMatrixLayout(
 // for the given matrix type and ciphertext semantic shape.
 bool isRelationPerRow(RankedTensorType matrixType, int64_t minSlotCount,
                       presburger::IntegerRelation relation);
+
+// Returns true if the relation corresponds to the canonical cyclic (CRT) layout
+// for the tensor type and ciphertext slot count. Requires rank >= 1 and all
+// dimensions > 1.
+bool isRelationCyclic(RankedTensorType type, int64_t numSlots,
+                      const presburger::IntegerRelation& relation);
 
 // Returns true if the given relation is a bicyclic layout for the given
 // matrix type and ciphertext semantic shape.
@@ -235,11 +282,22 @@ presburger::IntegerRelation shiftVar(
     const presburger::IntegerRelation& relation, unsigned int pos,
     int64_t offset);
 
+// Get layout relation that corresponds to a tensor::pad op.
+presburger::IntegerRelation getPaddingRelation(RankedTensorType paddedType,
+                                               RankedTensorType unpaddedType,
+                                               ArrayRef<int64_t> lowPadding);
+
 // Get layout relation that corresponds to a tensor::extract_slice op.
 FailureOr<presburger::IntegerRelation> getSliceExtractionRelation(
     RankedTensorType sourceType, RankedTensorType resultType,
     SmallVector<int64_t> offsets, SmallVector<int64_t> sizes,
     SmallVector<int64_t> strides);
+
+// Returns the relation corresponding to a transpose by permuting its domain
+// variables according to `permutation`: result domain index i corresponds to
+// original domain index `permutation[i]`.
+presburger::IntegerRelation getTransposedRelation(
+    const presburger::IntegerRelation& relation, ArrayRef<int64_t> permutation);
 
 // Tests whether two layout relations describe the same set of points.
 //

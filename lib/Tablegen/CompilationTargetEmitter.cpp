@@ -82,12 +82,21 @@ bool emitCompilationTargetRegistration(const llvm::RecordKeeper& records,
     auto name = target->getName();
     auto bootstrapLevelsConsumed =
         target->getValueAsInt("bootstrapLevelsConsumed");
+    auto hasKernelChebyshev = target->getValueAsInt("hasKernelChebyshev");
+    auto hasKernelLinearTransform =
+        target->getValueAsInt("hasKernelLinearTransform");
+    auto requiresMatchingCiphertextPlaintextLevels =
+        target->getValueAsInt("requiresMatchingCiphertextPlaintextLevels");
+    auto supportsAdjustScale = target->getValueAsInt("supportsAdjustScale");
 
     os << "void registerTarget" << name << "() {\n"
        << "  "
           "CompilationTargetRegistry::registerTarget(CompilationTarget{"
           "BackendName::"
-       << name << ", " << bootstrapLevelsConsumed << "});\n"
+       << name << ", " << bootstrapLevelsConsumed << ", " << hasKernelChebyshev
+       << ", " << hasKernelLinearTransform << ", "
+       << requiresMatchingCiphertextPlaintextLevels << ", "
+       << supportsAdjustScale << "});\n"
        << "}\n\n";
   }
   return false;

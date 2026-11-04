@@ -14,9 +14,11 @@ cc_library(
     ],
     deps = [
         ":pass_inc_gen",
+        "@heir//lib/Analysis/LevelAnalysis",
         "@heir//lib/Dialect:ModuleAttributes",
         "@heir//lib/Dialect/BGV/IR:Dialect",
         "@heir//lib/Dialect/CKKS/IR:Dialect",
+        "@heir//lib/Dialect/Kernel/IR:Dialect",
         "@heir//lib/Dialect/LWE/IR:Dialect",
         "@heir//lib/Dialect/Lattigo/IR:Dialect",
         "@heir//lib/Dialect/Orion/IR:Dialect",
@@ -27,10 +29,11 @@ cc_library(
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:ArithDialect",
         "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:FunctionInterfaces",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:Pass",
         "@llvm-project//mlir:Support",
-        "@llvm-project//mlir:TensorDialect",
+        "@llvm-project//mlir:TensorDialect",  # build_cleaner: keep
         "@llvm-project//mlir:TransformUtils",
     ],
 )

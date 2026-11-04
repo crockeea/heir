@@ -219,6 +219,93 @@ inline constexpr char kNestedFloorUnequalRelation[] =
     "+ 102*floor((-47 + 51i1 + i2 + 51slot + 8*floor((3 - 51i1 - i2)/2048))"
     "/102) }";
 
+// --- Criteo layouts ---
+
+inline constexpr char kCriteoLayout4[] =
+    "{ [i0, i1] -> [ct, slot] : (i0 - i1 + ct) mod 16 = 0 and (-i0 + slot) mod "
+    "512 = 0 and 0 <= i0 <= 511 and 0 <= i1 <= 12 and 0 <= ct <= 15 and 0 <= "
+    "slot <= 32767 }";
+
+inline constexpr char kCriteoLayout7[] =
+    "{ [i0, i1] -> [ct, slot] : (i0 - i1 + ct) mod 256 = 0 and (-i1 + ct + "
+    "slot) mod 512 = 0 and 0 <= i0 <= 255 and 0 <= i1 <= 511 and 0 <= ct <= "
+    "255 and 0 <= slot <= 32767 }";
+
+inline constexpr char kCriteoLayout24[] =
+    "{ [i0, i1] -> [ct, slot] : (i0 - i1 + ct) mod 512 = 0 and (-i0 + slot) "
+    "mod "
+    "512 = 0 and 0 <= i0 <= 511 and 0 <= i1 <= 431 and 0 <= ct <= 511 and 0 <= "
+    "slot <= 32767 }";
+
+// --- Lola layouts ---
+
+inline constexpr char kLolaLayout2[] =
+    "{ [i0, i1, i2, i3] -> [ct, slot] : exists (e1, e2, e3, e4, e5: i0 = 0 and "
+    "ct = 0 and 0 <= i1 <= 7 and 0 <= i2 <= 13 and 0 <= i3 <= 13 and 0 <= slot "
+    "<= 1567 and 2048*floor((-1 - 196i1 - 14i2 - i3)/2048) <= -481 - 196i1 - "
+    "14i2 - i3 and 0 <= e1 <= 13 and 2035 + 196i1 + 14i2 + i3 + 196slot + "
+    "2048*floor((-1 - 196i1 - 14i2 - i3)/2048) - 14e1 <= 392e2 <= 2048 + "
+    "196i1 + 14i2 + i3 + 196slot + 2048*floor((-1 - 196i1 - 14i2 - i3)/2048) - "
+    "14e1 and -3 - slot + 2e2 <= 4e3 <= -slot + 2e2 and -1 - slot + 4e1 + 2e2 "
+    "- 4e3 <= 2e4 <= -slot + 4e1 + 2e2 - 4e3 and -3 - slot + 2e2 <= 4e5 <= "
+    "-slot + 2e2 and -4097 - 392i1 - 28i2 - 2i3 - 391slot - 4096*floor((-1 - "
+    "196i1 - 14i2 - i3)/2048) + 28e1 + 784e2 - 28e4 <= 784e5 <= -4096 - 392i1 "
+    "- 28i2 - 2i3 - 391slot - 4096*floor((-1 - 196i1 - 14i2 - i3)/2048) + 28e1 "
+    "+ 784e2 - 28e4) }";
+
+inline constexpr char kLolaLayout12[] =
+    "{ [i0, i1] -> [ct, slot] : exists (e0, e1, e2, e3, e4, e5, e6: 2048e6 = "
+    "-i0 + slot + 128e5 and 0 <= i0 <= 99 and 0 <= i1 <= 1567 and 0 <= ct <= "
+    "127 and 0 <= slot <= 2047 and 0 <= e0 <= 13 and 128e5 >= -1567 + i0 + ct "
+    "and 128e5 >= i0 + ct - 2e1 + 4e2 and 128e5 >= i0 + ct - 2e1 + 4e4 and i0 "
+    "+ ct - 4e0 - 2e1 + 4e2 + 2e3 <= 128e5 <= 1 + i0 + ct - 4e0 - 2e1 + 4e2 + "
+    "2e3 and 128e5 <= 3 + i0 + ct - 2e1 + 4e4 and 128e5 <= 3 + i0 + ct - 2e1 "
+    "+ 4e2 and 128e5 <= i0 + ct and -13 + 196i0 + i1 + 196ct - 14e0 - 392e1 "
+    "<= 25088e5 <= 196i0 + i1 + 196ct - 14e0 - 392e1 and 391i0 + 2i1 + 391ct "
+    "- 28e0 - 784e1 + 28e3 + 784e4 <= 50048e5 <= 1 + 391i0 + 2i1 + 391ct - "
+    "28e0 - 784e1 + 28e3 + 784e4) }";
+
+// Filter layout of LoLA's stride-2 conv2d (8x1x2x2 filter, gap factor 2),
+// packed into 1024 ciphertexts of 2048 slots.
+// IntegerRelation::getConstantBound64(UB, ct) on it runs out of memory in
+// Fourier-Motzkin elimination (more than 100 GB in a compile), even though
+// ct <= 1023 is an explicit constraint. One isl_basic_map_fix_val +
+// isl_basic_map_is_empty probe per ct takes about 100 s in total.
+inline constexpr char kLolaGapFilterRelation[] =
+    "{ [i0, i1, i2, i3] -> [ct, slot] : exists (e1, e2, e3, e4, e5, e6: i1 = 0 "
+    "and 1024e5 = -i0 - 28i2 - i3 + ct + 784*floor((i0)/4) + 2e1 - 56e2 - 2e3 "
+    "+ 28e4 and 2048e6 = i0 + slot - 784*floor((i0)/4) - 2e1 - 28e4 and 0 <= "
+    "i0 <= 7 and 0 <= i2 <= 1 and 0 <= i3 <= 1 and 0 <= ct <= 1023 and 0 <= "
+    "slot <= 2047 and i0 <= 2e1 <= 27 + i0 and 0 <= e2 <= 13 and 0 <= e3 <= 13 "
+    "and -1 - i0 + 2e1 <= 2e3 <= -i0 + 2e1 and 0 <= e4 <= 27 and -1 + i0 - "
+    "4*floor((i0)/4) + 4e2 <= 2e4 <= i0 - 4*floor((i0)/4) + 4e2) }";
+
+// Slot-to-slot remap relation (inverse(from) composed with to) from one of
+// DS-CNN's tensor_ext.remap ops. isl_map_compute_divs on it takes about 260 s
+// and returns 15 pieces.
+inline constexpr char kDscnnRemap4Relation[] =
+    "{ [i0, i1] -> [ct, slot] : exists (e1, e2, e3, e4, e5, e6: i0 = 0 and ct "
+    "= 0 and 0 <= i1 <= 16383 and 0 <= slot <= 16383 and 8192*floor((192 + "
+    "i1)/8192) <= i1 and 0 <= e1 <= 1 and 8192e1 <= 192 + i1 and 0 <= e2 <= 24 "
+    "and 2e3 >= i1 and -3 - i1 + 2e3 <= 4e4 <= -i1 + 2e3 and -1 - i1 + 4e2 + "
+    "2e3 - 4e4 <= 2e5 <= -i1 + 4e2 + 2e3 - 4e4 and -3 - i1 + 2e3 <= 4e6 <= -i1 "
+    "+ 2e3 and 8192*floor((192 + slot)/8192) >= -4 + 125i1 + slot - "
+    "8192*floor((192 + i1)/8192) + 8192e1 - 5e2 - 250e3 and 8192*floor((192 + "
+    "slot)/8192) <= slot and 8192*floor((192 + slot)/8192) <= 125i1 + slot - "
+    "8192*floor((192 + i1)/8192) + 8192e1 - 5e2 - 250e3 and 249i1 + 2slot - "
+    "8192*floor((192 + i1)/8192) + 16384e1 - 10e2 - 500e3 + 10e5 + 500e6 <= "
+    "16384*floor((192 + slot)/8192) <= 1 + 249i1 + 2slot - 8192*floor((192 + "
+    "i1)/8192) + 16384e1 - 10e2 - 500e3 + 10e5 + 500e6) }";
+
+// Image set of a conv layout, which a dense-layout check compared against the
+// full [2048, 4096] box with isl_set_is_equal. The source relation was not
+// recorded.
+inline constexpr char kConvDenseCheckImageSet[] =
+    "{ [i0, i1] : exists (e0, e1, e2, e3: 0 <= i0 <= 2047 and 0 <= i1 <= 4095 "
+    "and 2048e0 <= -2048 + i1 and 0 <= e1 <= 63 and 0 <= e2 <= 63 and -2077 + "
+    "i1 - 2048e0 <= 30e2 <= -2048 + i1 - 2048e0 and -2 + i0 - 32e1 + 30e2 <= "
+    "2048e3 <= i0 - 32e1 + 30e2) }";
+
 }  // namespace heir
 }  // namespace mlir
 

@@ -18,6 +18,7 @@
 #include "mlir/include/mlir/Dialect/Affine/IR/AffineOps.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"    // from @llvm-project
 #include "mlir/include/mlir/Dialect/Func/IR/FuncOps.h"   // from @llvm-project
+#include "mlir/include/mlir/Dialect/Math/IR/Math.h"      // from @llvm-project
 #include "mlir/include/mlir/Dialect/MemRef/IR/MemRef.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/SCF/IR/SCF.h"        // from @llvm-project
 #include "mlir/include/mlir/Dialect/Tensor/IR/Tensor.h"  // from @llvm-project
@@ -136,6 +137,7 @@ class LattigoEmitter {
   LogicalResult printOperation(::mlir::arith::SubIOp op);
   LogicalResult printOperation(::mlir::arith::SubFOp op);
   LogicalResult printOperation(::mlir::arith::XOrIOp op);
+  LogicalResult printOperation(::mlir::math::SqrtOp op);
   LogicalResult printOperation(::mlir::func::CallOp op);
   LogicalResult printOperation(::mlir::func::FuncOp op);
   LogicalResult printOperation(::mlir::func::ReturnOp op);
@@ -219,11 +221,24 @@ class LattigoEmitter {
   LogicalResult printOperation(CKKSRescaleOp op);
   LogicalResult printOperation(CKKSBootstrapOp op);
   LogicalResult printOperation(CKKSRotateOp op);
-  LogicalResult printOperation(CKKSLinearTransformOp op);
+  LogicalResult printOperation(CKKSPrepareLinearTransformOp op);
+  LogicalResult printOperation(CKKSApplyLinearTransformOp op);
   LogicalResult printOperation(CKKSChebyshevOp op);
 
   // Helpers for above
   void printErrPanic(std::string_view errName);
+  void printDiagonalsUnpack(llvm::StringRef diagonalsName,
+                            ShapedType diagonalsType,
+                            DenseI32ArrayAttr diagonalIndicesAttr,
+                            DenseI32ArrayAttr sourceRowIndicesAttr,
+                            llvm::StringRef slotsExpr,
+                            std::optional<int64_t> staticSlots,
+                            llvm::StringRef prefix,
+                            std::string& diagonalsMapName);
+  void printLinearTransformEvaluate(llvm::StringRef evaluatorName,
+                                    llvm::StringRef inputName,
+                                    llvm::StringRef transformationName,
+                                    llvm::StringRef outputName);
 
   LogicalResult printNewMethod(::mlir::Value result,
                                ::mlir::ValueRange operands, std::string_view op,

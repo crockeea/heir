@@ -45,17 +45,14 @@ func TestConv2DDilated(t *testing.T) {
 	}
 
 	ct0 := Conv2d_dilated__encrypt__arg0(evaluator, params, ecd, enc, arg0)
+	ctZeros := Conv2d_dilated__encrypt__zeros(evaluator, params, ecd, enc)
 
 	startPre := time.Now()
 	filterPlains := conv2d_dilated_utils.Conv2d_dilated__preprocessing(params, ecd)
 	t.Logf("Preprocessing took %s", time.Since(startPre))
 
-	// Rolled kernels accumulate into an encrypted zero, which the client must
-	// supply.
-	ctZero := Conv2d_dilated__encrypt__zero__0(evaluator, params, ecd, enc)
-
 	start := time.Now()
-	resultCt := Conv2d_dilated__preprocessed(evaluator, params, ecd, ct0, ctZero, filterPlains)
+	resultCt := Conv2d_dilated__preprocessed(evaluator, params, ecd, ct0, ctZeros, filterPlains)
 	t.Logf("Conv2d_dilated (preprocessed) took %s", time.Since(start))
 
 	result := Conv2d_dilated__decrypt__result0(evaluator, params, ecd, dec, resultCt)

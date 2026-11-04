@@ -156,44 +156,6 @@ struct ConvertConstant : public OpConversionPattern<mlir::arith::ConstantOp> {
   }
 };
 
-struct ConvertExtSI : public OpConversionPattern<mlir::arith::ExtSIOp> {
-  ConvertExtSI(mlir::MLIRContext* context)
-      : OpConversionPattern<mlir::arith::ExtSIOp>(context) {}
-
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult matchAndRewrite(
-      ::mlir::arith::ExtSIOp op, OpAdaptor adaptor,
-      ConversionPatternRewriter& rewriter) const override {
-    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
-
-    auto result = mod_arith::ModSwitchOp::create(
-        b, op.getLoc(), typeConverter->convertType(op.getType()),
-        adaptor.getIn());
-    rewriter.replaceOp(op, result);
-    return success();
-  }
-};
-
-struct ConvertExtUI : public OpConversionPattern<mlir::arith::ExtUIOp> {
-  ConvertExtUI(mlir::MLIRContext* context)
-      : OpConversionPattern<mlir::arith::ExtUIOp>(context) {}
-
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult matchAndRewrite(
-      ::mlir::arith::ExtUIOp op, OpAdaptor adaptor,
-      ConversionPatternRewriter& rewriter) const override {
-    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
-
-    auto result = mod_arith::ModSwitchOp::create(
-        b, op.getLoc(), typeConverter->convertType(op.getType()),
-        adaptor.getIn());
-    rewriter.replaceOp(op, result);
-    return success();
-  }
-};
-
 struct ConvertLoadOp : public OpConversionPattern<mlir::memref::LoadOp> {
   ConvertLoadOp(mlir::MLIRContext* context)
       : OpConversionPattern<mlir::memref::LoadOp>(context) {}
@@ -277,34 +239,32 @@ void ArithToModArith::runOnOperation() {
             typeConverter.isLegal(op->getResultTypes()));
   });
 
+  RewritePatternSet patterns(context);
+  addStructuralConversionPatterns(typeConverter, patterns, target);
+  addTensorConversionPatterns(typeConverter, patterns, target);
+
   target.addDynamicallyLegalOp<
       memref::AllocOp, memref::DeallocOp, memref::StoreOp, memref::SubViewOp,
-      memref::CopyOp, tensor::FromElementsOp, tensor::ExtractOp,
-      tensor::ExtractSliceOp, tensor::InsertOp, tensor::ExpandShapeOp,
-      tensor::ConcatOp, affine::AffineStoreOp, affine::AffineLoadOp,
-      affine::AffineForOp, affine::AffineYieldOp, tensor_ext::RotateOp>(
+      memref::CopyOp, tensor::ExpandShapeOp, tensor::ConcatOp,
+      affine::AffineStoreOp, affine::AffineLoadOp, tensor_ext::RotateOp>(
       [&](Operation* op) {
         return typeConverter.isLegal(op->getOperandTypes()) &&
                typeConverter.isLegal(op->getResultTypes());
       });
 
-  RewritePatternSet patterns(context);
   patterns
-      .add<ConvertConstant, ConvertExtSI, ConvertExtUI,
+      .add<ConvertConstant,
+           ConvertUnaryOp<mlir::arith::ExtSIOp, mod_arith::ModSwitchOp>,
+           ConvertUnaryOp<mlir::arith::ExtUIOp, mod_arith::ModSwitchOp>,
            ConvertBinOp<mlir::arith::AddIOp, mod_arith::AddOp>,
            ConvertBinOp<mlir::arith::SubIOp, mod_arith::SubOp>,
            ConvertBinOp<mlir::arith::MulIOp, mod_arith::MulOp>, ConvertLoadOp,
            ConvertAny<memref::AllocOp>, ConvertAny<memref::DeallocOp>,
            ConvertAny<memref::StoreOp>, ConvertAny<memref::SubViewOp>,
-           ConvertAny<memref::CopyOp>, ConvertAny<tensor::FromElementsOp>,
-           ConvertAny<tensor::ExtractOp>, ConvertAny<tensor::ExtractSliceOp>,
-           ConvertAny<tensor::InsertOp>, ConvertAny<tensor::ExpandShapeOp>,
+           ConvertAny<memref::CopyOp>, ConvertAny<tensor::ExpandShapeOp>,
            ConvertAny<tensor::ConcatOp>, ConvertAny<affine::AffineStoreOp>,
-           ConvertAny<affine::AffineLoadOp>, ConvertAny<affine::AffineForOp>,
-           ConvertAny<affine::AffineYieldOp>, ConvertAny<tensor_ext::RotateOp>>(
+           ConvertAny<affine::AffineLoadOp>, ConvertAny<tensor_ext::RotateOp>>(
           typeConverter, context);
-
-  addStructuralConversionPatterns(typeConverter, patterns, target);
 
   ConversionConfig config;
   config.allowPatternRollback = false;

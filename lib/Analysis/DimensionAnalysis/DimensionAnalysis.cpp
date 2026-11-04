@@ -33,6 +33,10 @@ namespace heir {
 LogicalResult DimensionAnalysis::visitOperation(
     Operation* op, ArrayRef<const DimensionLattice*> operands,
     ArrayRef<DimensionLattice*> results) {
+  if (hasUnknownSecretness(op)) {
+    return success();
+  }
+
   auto propagate = [&](Value value, const DimensionState& state) {
     auto* lattice = getLatticeElement(value);
     ChangeResult changed = lattice->join(state);
@@ -91,10 +95,11 @@ LogicalResult DimensionAnalysis::visitOperation(
 void DimensionAnalysis::visitExternalCall(
     CallOpInterface call, ArrayRef<const DimensionLattice*> argumentLattices,
     ArrayRef<DimensionLattice*> resultLattices) {
-  auto callback = std::bind(&DimensionAnalysis::propagateIfChangedWrapper, this,
-                            std::placeholders::_1, std::placeholders::_2);
   ::mlir::heir::visitExternalCall<DimensionState, DimensionLattice>(
-      call, argumentLattices, resultLattices, callback);
+      call, argumentLattices, resultLattices,
+      [this](AnalysisState* state, ChangeResult changed) {
+        this->propagateIfChanged(state, changed);
+      });
 }
 
 //===----------------------------------------------------------------------===//
@@ -108,6 +113,10 @@ void DimensionAnalysisBackward::setToExitState(DimensionLattice* lattice) {
 LogicalResult DimensionAnalysisBackward::visitOperation(
     Operation* op, ArrayRef<DimensionLattice*> operands,
     ArrayRef<const DimensionLattice*> results) {
+  if (hasUnknownSecretness(op)) {
+    return success();
+  }
+
   auto propagate = [&](Value value, const DimensionState& state) {
     auto* lattice = getLatticeElement(value);
     ChangeResult changed = lattice->join(state);
@@ -139,7 +148,7 @@ LogicalResult DimensionAnalysisBackward::visitOperation(
 
   // also backprop to mgmt.init if it is not secret
   for (auto& opOperand : op->getOpOperands()) {
-    if (!isSecretInternal(op, opOperand.get()) &&
+    if (!isSecretInternal(op, opOperand.get()).value_or(false) &&
         isa_and_nonnull<mgmt::InitOp>(opOperand.get().getDefiningOp())) {
       propagate(opOperand.get(), DimensionState(dimensionResult));
     }

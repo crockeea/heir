@@ -26,17 +26,15 @@
 !ct_L13 = !lwe.lwe_ciphertext<plaintext_space = <ring = #ring_f64_1_x131072, encoding = #inverse_canonical_encoding>, ciphertext_space = #ciphertext_space_L13, key = #key, modulus_chain = #modulus_chain_L13_C13>
 !ct_L2 = !lwe.lwe_ciphertext<plaintext_space = <ring = #ring_f64_1_x131072, encoding = #inverse_canonical_encoding>, ciphertext_space = #ciphertext_space_L2, key = #key, modulus_chain = #modulus_chain_L2_C2>
 
-// CHECK-DAG: ![[bEvalType:.*]] = !lattigo.ckks.bootstrapping_evaluator
-// CHECK-DAG: ![[evalType:.*]] = !lattigo.ckks.evaluator
-// CHECK-DAG: ![[ctType:.*]] = !lattigo.rlwe.ciphertext
 
-// CHECK: func.func @bootstrap
-// CHECK-SAME: (%[[bEval:.*]]: ![[bEvalType]],
-// CHECK-SAME:  %[[eval:.*]]: ![[evalType]],
-// CHECK-SAME: , %[[ct:\w+]]: ![[ctType]])
-// CHECK: lattigo.ckks.bootstrap %[[bEval]], %[[ct]]
-
-module attributes {backend.lattigo, ckks.schemeParam = #ckks.scheme_param<logN = 14, Q = [0x200000440001, 0x7fff80001, 0x800280001], P = [0x3ffffffb80001, 0x4000000800001], logDefaultScale = 60>, scheme.ckks} {
+// scheme.requested_slot_count is what generate-param-ckks records for a
+// requested ciphertext-degree below the ring's slot capacity (here 2048 of the
+// 8192 slots of a logN-14 ring). It must not be turned into a sparse
+// bootstrapping LogSlots: lattigo sizes only the CoeffsToSlots/SlotsToCoeffs
+// matrices from LogSlots while Bootstrap relabels its input to the full
+// LogMaxDimensions, so a sparse value mixes slot values and this test decrypts
+// to garbage.
+module attributes {backend.lattigo, ckks.schemeParam = #ckks.scheme_param<logN = 14, Q = [0x200000440001, 0x7fff80001, 0x800280001], P = [0x3ffffffb80001, 0x4000000800001], logDefaultScale = 60>, scheme.ckks, scheme.requested_slot_count = 2048 : i64} {
   func.func @bootstrap(%ct: !ct_L2) -> !ct_L13 {
     %ct_0 = ckks.bootstrap %ct : !ct_L2 -> !ct_L13
     return %ct_0 : !ct_L13

@@ -15,13 +15,14 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 class TensorExt_Op<string mnemonic, list<Trait> traits = []> :
         Op<TensorExt_Dialect, mnemonic, traits> {
   let cppNamespace = "::mlir::heir::tensor_ext";
-  let assemblyFormat = "operands attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "operands prop-dict attr-dict `:` functional-type(operands, results)";
 }
 
 def TensorExt_RotateOp : TensorExt_Op<"rotate", [
   Pure,
   AllTypesMatch<["tensor", "output"]>,
-  DeclareOpInterfaceMethods<RotationOpInterface>
+  DeclareOpInterfaceMethods<RotationOpInterface>,
+  RequiresLinearKeyBasisOpInterface
 ]> {
   let summary = "Rotate a tensor some number of indices left.";
   let description = [{
@@ -74,7 +75,7 @@ def TensorExt_RemapOp : TensorExt_Op<"remap", [Pure, AllTypesMatch<["input", "ou
     represent a ciphertext slot-repacking operation. However, it can more
     generally express any partial mapping from source tensor indices to target
     indices within a tensor. Unmapped entries from the input tensor are
-    unmodified.
+    zeroed out in the output tensor.
 
     This operation differs from a `tensor.gather/scatter` operation in that it
     can replicate values from the source tensor or omit values in the
@@ -89,7 +90,7 @@ def TensorExt_RemapOp : TensorExt_Op<"remap", [Pure, AllTypesMatch<["input", "ou
 
   let arguments = (ins AnyRankedTensor:$input, MappingLike:$permutation);
   let results = (outs AnyRankedTensor:$output);
-  let assemblyFormat = "operands attr-dict `:` type($input)";
+  let assemblyFormat = "operands prop-dict attr-dict `:` type($input)";
   let hasVerifier = 1;
 }
 
@@ -123,7 +124,7 @@ def TensorExt_ConvertLayoutOp : TensorExt_Op<"convert_layout", [Pure, AllTypesMa
     layout assignment. See `tensor_ext.assign_layout` for more details.
   }];
 
-  let assemblyFormat = "operands attr-dict `:` type($output)";
+  let assemblyFormat = "operands prop-dict attr-dict `:` type($output)";
   let arguments = (ins
       AnyType:$value,
       LayoutLike:$from_layout,
@@ -156,7 +157,7 @@ def TensorExt_AssignLayoutOp : TensorExt_Op<"assign_layout", [Pure, AllTypesMatc
     a slower generated loop nest.
   }];
 
-  let assemblyFormat = "operands attr-dict `:` type($output)";
+  let assemblyFormat = "operands prop-dict attr-dict `:` type($output)";
   let arguments = (ins
       AnyType:$value,
       LayoutLike:$layout,
@@ -302,5 +303,30 @@ def TensorExt_RotateAndReduceOp : TensorExt_Op<"rotate_and_reduce", [
   // TODO(#2134): Add canonicalization patterns
 }
 
+def TensorExt_BroadcastedReduceOp : TensorExt_Op<"broadcasted_reduce", [
+  Pure,
+  AllTypesMatch<["tensor", "output"]>
+]> {
+  let summary = "Broadcasted reduction of a tensor along a dimension.";
+  let description = [{
+    This op reduces a tensor along a specified dimension and broadcasts the
+    result back to the original shape.
+
+    The reduction operation is specified by the `reduceOp` attribute.
+    The chosen op must be one of `arith.addi`, `arith.addf`, `arith.muli`,
+    or `arith.mulf`.
+
+    This op is layout-preserving.
+  }];
+
+  let arguments = (ins
+    AnyRankedTensor:$tensor,
+    I64Attr:$dimension,
+    OptionalAttr<Builtin_StringAttr>:$reduceOp
+  );
+  let results = (outs AnyRankedTensor:$output);
+  let assemblyFormat = "operands prop-dict attr-dict `:` type($tensor)";
+  let hasVerifier = 1;
+}
 
 #endif  // LIB_DIALECT_TENSOREXT_IR_TENSOREXTOPS_TD_

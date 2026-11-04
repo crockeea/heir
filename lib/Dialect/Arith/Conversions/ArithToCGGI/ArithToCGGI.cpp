@@ -201,72 +201,6 @@ class ArithToCGGITypeConverter : public TypeConverter {
   }
 };
 
-struct ConvertTruncIOp : public OpConversionPattern<mlir::arith::TruncIOp> {
-  ConvertTruncIOp(mlir::MLIRContext* context)
-      : OpConversionPattern<mlir::arith::TruncIOp>(context) {}
-
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult matchAndRewrite(
-      mlir::arith::TruncIOp op, OpAdaptor adaptor,
-      ConversionPatternRewriter& rewriter) const override {
-    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
-
-    ArithToCGGITypeConverter typeConverter(op->getContext());
-    auto outputType = typeConverter.convertType(op.getResult().getType());
-
-    auto castOp =
-        cggi::CastOp::create(b, op.getLoc(), outputType, adaptor.getIn());
-
-    rewriter.replaceOp(op, castOp);
-    return success();
-  }
-};
-
-struct ConvertExtUIOp : public OpConversionPattern<mlir::arith::ExtUIOp> {
-  ConvertExtUIOp(mlir::MLIRContext* context)
-      : OpConversionPattern<mlir::arith::ExtUIOp>(context) {}
-
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult matchAndRewrite(
-      mlir::arith::ExtUIOp op, OpAdaptor adaptor,
-      ConversionPatternRewriter& rewriter) const override {
-    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
-
-    ArithToCGGITypeConverter typeConverter(op->getContext());
-    auto outputType = typeConverter.convertType(op.getResult().getType());
-
-    auto castOp =
-        cggi::CastOp::create(b, op.getLoc(), outputType, adaptor.getIn());
-
-    rewriter.replaceOp(op, castOp);
-    return success();
-  }
-};
-
-struct ConvertExtSIOp : public OpConversionPattern<mlir::arith::ExtSIOp> {
-  ConvertExtSIOp(mlir::MLIRContext* context)
-      : OpConversionPattern<mlir::arith::ExtSIOp>(context) {}
-
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult matchAndRewrite(
-      mlir::arith::ExtSIOp op, OpAdaptor adaptor,
-      ConversionPatternRewriter& rewriter) const override {
-    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
-
-    ArithToCGGITypeConverter typeConverter(op->getContext());
-    auto outputType = typeConverter.convertType(op.getResult().getType());
-
-    auto castOp =
-        cggi::CastOp::create(b, op.getLoc(), outputType, adaptor.getIn());
-
-    rewriter.replaceOp(op, castOp);
-    return success();
-  }
-};
-
 struct ConvertCmpOp : public OpConversionPattern<mlir::arith::CmpIOp> {
   ConvertCmpOp(mlir::MLIRContext* context)
       : OpConversionPattern<mlir::arith::CmpIOp>(context) {}
@@ -465,25 +399,6 @@ struct ConvertArithBinOp : public OpConversionPattern<SourceArithOp> {
   }
 };
 
-template <typename SourceArithOp, typename TargetCGGIOp>
-struct ConvertBinOp : public OpConversionPattern<SourceArithOp> {
-  ConvertBinOp(mlir::MLIRContext* context)
-      : OpConversionPattern<SourceArithOp>(context) {}
-
-  using OpConversionPattern<SourceArithOp>::OpConversionPattern;
-
-  LogicalResult matchAndRewrite(
-      SourceArithOp op, typename SourceArithOp::Adaptor adaptor,
-      ConversionPatternRewriter& rewriter) const override {
-    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
-
-    auto result = TargetCGGIOp::create(b, adaptor.getLhs().getType(),
-                                       adaptor.getLhs(), adaptor.getRhs());
-    rewriter.replaceOp(op, result);
-    return success();
-  }
-};
-
 struct ConvertAllocOp : public OpConversionPattern<mlir::memref::AllocOp> {
   ConvertAllocOp(mlir::MLIRContext* context)
       : OpConversionPattern<mlir::memref::AllocOp>(context) {}
@@ -553,14 +468,15 @@ struct ArithToCGGI : public impl::ArithToCGGIBase<ArithToCGGI> {
       return false;
     });
 
+    addTensorConversionPatterns(typeConverter, patterns, target);
+
     // Tensor ops (and other allowed dialects) are allowed only if their
     // operands and results are the correct type
-    target.addDynamicallyLegalOp<
-        memref::SubViewOp, memref::CopyOp, tensor::FromElementsOp,
-        tensor::ExtractOp, tensor::InsertOp, bufferization::AllocTensorOp,
-        tensor::EmptyOp, tensor::ExtractSliceOp, tensor::ConcatOp,
-        tensor::CastOp, tensor::DimOp, linalg::YieldOp, linalg::GenericOp,
-        linalg::FillOp, affine::AffineForOp, affine::AffineYieldOp>(
+    target.addDynamicallyLegalOp<memref::SubViewOp, memref::CopyOp,
+                                 bufferization::AllocTensorOp, tensor::ConcatOp,
+                                 tensor::CastOp, tensor::DimOp, linalg::YieldOp,
+                                 linalg::GenericOp, linalg::FillOp,
+                                 affine::AffineForOp, affine::AffineYieldOp>(
         [&](Operation* op) {
           return typeConverter.isLegal(op->getOperandTypes()) &&
                  typeConverter.isLegal(op->getResultTypes());
@@ -687,31 +603,29 @@ struct ArithToCGGI : public impl::ArithToCGGIBase<ArithToCGGI> {
       return true;
     });
 
-    patterns.add<
-        ConvertTruncIOp, ConvertExtUIOp, ConvertExtSIOp, ConvertSelectOp,
-        ConvertCmpOp, ConvertSubOp, ConvertLutOp,
-        ConvertShOp<mlir::arith::ShRSIOp, cggi::ScalarShiftRightOp>,
-        ConvertShOp<mlir::arith::ShRUIOp, cggi::ScalarShiftRightOp>,
-        ConvertShOp<mlir::arith::ShLIOp, cggi::ScalarShiftLeftOp>,
-        ConvertArithBinOp<mlir::arith::AddIOp, cggi::AddOp>,
-        ConvertArithBinOp<mlir::arith::MulIOp, cggi::MulOp>,
-        ConvertArithBinOp<mlir::arith::MaxSIOp, cggi::MaxOp>,
-        ConvertArithBinOp<mlir::arith::MinSIOp, cggi::MinOp>,
-        ConvertArithBinOp<mlir::arith::MaxUIOp, cggi::MaxOp>,
-        ConvertArithBinOp<mlir::arith::MinUIOp, cggi::MinOp>,
-        ConvertBinOp<mlir::arith::XOrIOp, cggi::XorOp>,
-        ConvertAny<memref::LoadOp>, ConvertAllocOp,
-        ConvertAny<memref::DeallocOp>, ConvertAny<memref::SubViewOp>,
-        ConvertAny<memref::CopyOp>, ConvertAny<memref::StoreOp>,
-        ConvertAny<tensor::FromElementsOp>, ConvertAny<tensor::ExtractOp>,
-        ConvertAny<tensor::DimOp>, ConvertAny<tensor::ExtractSliceOp>,
-        ConvertAny<tensor::CastOp>, ConvertAny<tensor::ConcatOp>,
-        ConvertAny<bufferization::AllocTensorOp>, ConvertAny<linalg::YieldOp>,
-        ConvertAny<linalg::GenericOp>, ConvertAny<linalg::FillOp>,
-        ConvertAny<tensor::InsertOp>, ConvertAny<tensor::EmptyOp>,
-        ConvertAny<affine::AffineStoreOp>, ConvertAny<affine::AffineLoadOp>,
-        ConvertAny<affine::AffineForOp>, ConvertAny<affine::AffineYieldOp> >(
-        typeConverter, context);
+    patterns.add<ConvertUnaryOp<mlir::arith::TruncIOp, cggi::CastOp>,
+                 ConvertUnaryOp<mlir::arith::ExtUIOp, cggi::CastOp>,
+                 ConvertUnaryOp<mlir::arith::ExtSIOp, cggi::CastOp>,
+                 ConvertSelectOp, ConvertCmpOp, ConvertSubOp, ConvertLutOp,
+                 ConvertShOp<mlir::arith::ShRSIOp, cggi::ScalarShiftRightOp>,
+                 ConvertShOp<mlir::arith::ShRUIOp, cggi::ScalarShiftRightOp>,
+                 ConvertShOp<mlir::arith::ShLIOp, cggi::ScalarShiftLeftOp>,
+                 ConvertArithBinOp<mlir::arith::AddIOp, cggi::AddOp>,
+                 ConvertArithBinOp<mlir::arith::MulIOp, cggi::MulOp>,
+                 ConvertArithBinOp<mlir::arith::MaxSIOp, cggi::MaxOp>,
+                 ConvertArithBinOp<mlir::arith::MinSIOp, cggi::MinOp>,
+                 ConvertArithBinOp<mlir::arith::MaxUIOp, cggi::MaxOp>,
+                 ConvertArithBinOp<mlir::arith::MinUIOp, cggi::MinOp>,
+                 ConvertBinOp<mlir::arith::XOrIOp, cggi::XorOp>,
+                 ConvertAny<memref::LoadOp>, ConvertAllocOp,
+                 ConvertAny<memref::DeallocOp>, ConvertAny<memref::SubViewOp>,
+                 ConvertAny<memref::CopyOp>, ConvertAny<memref::StoreOp>,
+                 ConvertAny<tensor::DimOp>, ConvertAny<tensor::CastOp>,
+                 ConvertAny<tensor::ConcatOp>,
+                 ConvertAny<bufferization::AllocTensorOp>,
+                 ConvertAny<linalg::YieldOp>, ConvertAny<linalg::GenericOp>,
+                 ConvertAny<linalg::FillOp>, ConvertAny<affine::AffineStoreOp>,
+                 ConvertAny<affine::AffineLoadOp> >(typeConverter, context);
 
     addStructuralConversionPatterns(typeConverter, patterns, target);
 

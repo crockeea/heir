@@ -18,7 +18,8 @@
 #include "lib/Kernel/KernelName.h"
 #include "lib/Utils/APIntUtils.h"
 #include "lib/Utils/MathUtils.h"
-#include "mlir/include/mlir/Support/LLVM.h"  // from @llvm-project
+#include "llvm/include/llvm/Support/MathExtras.h"  // from @llvm-project
+#include "mlir/include/mlir/Support/LLVM.h"        // from @llvm-project
 
 namespace mlir {
 namespace heir {
@@ -77,13 +78,33 @@ std::enable_if_t<std::is_base_of<AbstractValue, T>::value,
 implementRotateAndReduceAccumulation(
     std::shared_ptr<ArithmeticDagNode<T>> vectorDag, int64_t period,
     int64_t steps, DagReducer<T> reduceFunc) {
+  assert(steps >= 1 && "rotate-and-reduce needs at least one step");
   using NodeTy = ArithmeticDagNode<T>;
-  for (int64_t shiftSize = steps / 2; shiftSize > 0; shiftSize /= 2) {
+  // Reduces `steps` consecutive elements via bit decomposition to support
+  // arbitrary (non-power-of-two) lengths.
+  //
+  // We decompose `steps` into its binary representation: steps = \sum b_k 2^k.
+  // For each power-of-two `shiftSize = 1, 2 , ... <= steps`, if the
+  // corresponding decomposed bit is 1, accumulate `vectorDag` shifted by
+  // `offset * period` into `acc`, and advance `offset` by `shiftSize`.
+  std::shared_ptr<ArithmeticDagNode<T>> acc = nullptr;
+  int64_t offset = 0;
+  for (int64_t shiftSize = 1; shiftSize <= steps; shiftSize *= 2) {
+    if (steps & shiftSize) {
+      if (acc == nullptr) {
+        acc = vectorDag;
+      } else {
+        auto rotated = NodeTy::leftRotate(vectorDag, offset * period);
+        acc = reduceFunc(acc, rotated);
+      }
+      offset += shiftSize;
+      if (offset == steps) break;
+    }
     auto rotated = NodeTy::leftRotate(vectorDag, shiftSize * period);
     auto reduced = reduceFunc(vectorDag, rotated);
     vectorDag = reduced;
   }
-  return vectorDag;
+  return acc;
 }
 
 template <typename T>
@@ -100,14 +121,19 @@ implementRotateAndReduceAccumulation(const T& vector, int64_t period,
 template <typename T>
 std::enable_if_t<std::is_base_of<AbstractValue, T>::value,
                  std::shared_ptr<ArithmeticDagNode<T>>>
-implementRotateAndReduceAccumulationRolled(const T& vector, int64_t period,
-                                           int64_t steps,
-                                           DagReducer<T> reduceFunc,
-                                           const DagType& baseType) {
+implementRotateAndReduceAccumulationRolled(
+    std::shared_ptr<ArithmeticDagNode<T>> vectorDag, int64_t period,
+    int64_t steps, DagReducer<T> reduceFunc, const DagType& baseType) {
   using NodeTy = ArithmeticDagNode<T>;
   using NodePtr = std::shared_ptr<NodeTy>;
 
-  auto vectorDag = NodeTy::leaf(vector);
+  // Non-power-of-two steps fall back to the unrolled form because the variable
+  // shift and rotation sequence cannot be expressed as a uniform loop with a
+  // single halved shift per iteration.
+  if ((steps & (steps - 1)) != 0) {
+    return implementRotateAndReduceAccumulation<T>(vectorDag, period, steps,
+                                                   reduceFunc);
+  }
   int64_t numIterations = static_cast<int64_t>(std::log2(steps));
   if (numIterations <= 0) return vectorDag;
 
@@ -130,6 +156,19 @@ implementRotateAndReduceAccumulationRolled(const T& vector, int64_t period,
       });
 
   return NodeTy::resultAt(loopNode, 0);
+}
+
+// Rolled version of implementRotateAndReduceAccumulation.
+template <typename T>
+std::enable_if_t<std::is_base_of<AbstractValue, T>::value,
+                 std::shared_ptr<ArithmeticDagNode<T>>>
+implementRotateAndReduceAccumulationRolled(const T& vector, int64_t period,
+                                           int64_t steps,
+                                           DagReducer<T> reduceFunc,
+                                           const DagType& baseType) {
+  using NodeTy = ArithmeticDagNode<T>;
+  return implementRotateAndReduceAccumulationRolled<T>(
+      NodeTy::leaf(vector), period, steps, reduceFunc, baseType);
 }
 
 // A function that generalizes the choice of rotation for the "baby stepped
@@ -499,6 +538,62 @@ implementDot(const T& lhs, const T& rhs, int64_t steps,
                                                  NodeTy::add);
 }
 
+// Returns an arithmetic DAG that implements a broadcasted reduce kernel.
+template <typename T>
+std::enable_if_t<std::is_base_of<AbstractValue, T>::value,
+                 std::shared_ptr<ArithmeticDagNode<T>>>
+implementBroadcastedReduce(
+    std::shared_ptr<ArithmeticDagNode<T>> vectorDag,
+    std::optional<std::shared_ptr<ArithmeticDagNode<T>>> cleanupMaskDag,
+    int64_t period, int64_t steps, int64_t numSlots, const DagType& dagType,
+    const std::string& reduceOp = "arith.addi", bool unroll = true) {
+  using NodeTy = ArithmeticDagNode<T>;
+  using NodePtr = std::shared_ptr<NodeTy>;
+
+  DagReducer<T> reduceFunc = [&](NodePtr lhs, NodePtr rhs) {
+    if (reduceOp == "arith.addi" || reduceOp == "arith.addf") {
+      return NodeTy::add(lhs, rhs);
+    }
+    if (reduceOp == "arith.muli" || reduceOp == "arith.mulf") {
+      return NodeTy::mul(lhs, rhs);
+    }
+    return NodeTy::add(lhs, rhs);
+  };
+
+  NodePtr reduced;
+  if (unroll) {
+    reduced = implementRotateAndReduceAccumulation<T>(vectorDag, period, steps,
+                                                      reduceFunc);
+  } else {
+    reduced = implementRotateAndReduceAccumulationRolled<T>(
+        vectorDag, period, steps, reduceFunc, dagType);
+  }
+
+  // Check Natural Replication
+  if (steps * period == numSlots) {
+    return reduced;
+  }
+
+  // Shift to last slots
+  int64_t shiftToLast = numSlots - (steps - 1) * period;
+  auto shifted = NodeTy::leftRotate(reduced, shiftToLast);
+
+  NodePtr current = shifted;
+  // Cleanup Mask
+  if (cleanupMaskDag.has_value()) {
+    current = NodeTy::mul(current, cleanupMaskDag.value());
+  }
+
+  // Replication Tree (Left rotations only)
+  for (int64_t rep_shift = 1; rep_shift < steps; rep_shift *= 2) {
+    int64_t rotateAmount = rep_shift * period;
+    auto rotated = NodeTy::leftRotate(current, rotateAmount);
+    current = reduceFunc(current, rotated);
+  }
+
+  return current;
+}
+
 // Returns an arithmetic DAG that implements a baby-step-giant-step between
 // ciphertexts.
 //
@@ -532,39 +627,47 @@ implementCiphertextCiphertextBabyStepGiantStep(
                                        derivedRotationIndexFn);
 }
 
-// Returns an arithmetic DAG that implements the Halevi-Shoup matrix
-// multiplication algorithm. This implementation uses a rotate-and-reduce
-// operation, followed by a summation of partial sums if the matrix is not
-// square.
+// Stage 1 of Halevi-Shoup: the weighted sum of the vector's rotations, one term
+// per diagonal of the packed matrix.
 template <typename T>
 std::enable_if_t<std::is_base_of<AbstractValue, T>::value,
                  std::shared_ptr<ArithmeticDagNode<T>>>
-implementHaleviShoup(const T& vector, const T& matrix,
-                     std::vector<int64_t> originalMatrixShape,
-                     const DagType& dagType,
-                     std::map<int, bool> zeroDiagonals = {},
-                     bool unroll = true) {
+implementHaleviShoupDiagonalSum(const T& vector, const T& matrix,
+                                const DagType& dagType,
+                                std::map<int, bool> zeroDiagonals = {},
+                                bool unroll = true) {
+  int64_t numRotations = matrix.getShape()[0];
+  return implementRotateAndReduce<T>(vector, std::optional<T>(matrix),
+                                     /*period=*/1,
+                                     /*steps=*/numRotations, dagType,
+                                     zeroDiagonals,
+                                     /*reduceOp=*/"arith.addi",
+                                     /*unroll=*/unroll);
+}
+
+// Stage 2 of Halevi-Shoup: the post-processing partial-rotate-and-reduce that a
+// squat-diagonal packing needs, which brings together the partial sums of a
+// matrix with fewer rows than columns. A square packing needs no fold, and
+// `summedShifts` comes straight back.
+//
+// `originalMatrixShape` is the shape the packing was built against, NOT the
+// shape of the packed matrix.
+template <typename T>
+std::enable_if_t<std::is_base_of<AbstractValue, T>::value,
+                 std::shared_ptr<ArithmeticDagNode<T>>>
+implementSquatDiagonalFold(std::shared_ptr<ArithmeticDagNode<T>> summedShifts,
+                           std::vector<int64_t> originalMatrixShape,
+                           const DagType& dagType, bool unroll = true) {
   using NodeTy = ArithmeticDagNode<T>;
   using NodePtr = std::shared_ptr<NodeTy>;
-  int64_t numRotations = matrix.getShape()[0];
 
-  auto rotateAndReduceResult = implementRotateAndReduce<T>(
-      vector, std::optional<T>(matrix), /*period=*/1,
-      /*steps=*/numRotations, dagType, zeroDiagonals,
-      /*reduceOp=*/"arith.addi",
-      /*unroll=*/unroll);
-
-  auto summedShifts = rotateAndReduceResult;
-
-  int64_t matrixNumRows = nextPowerOfTwo(originalMatrixShape[0]);
-  int64_t matrixNumCols = nextPowerOfTwo(originalMatrixShape[1]);
+  int64_t matrixNumRows = llvm::PowerOf2Ceil(originalMatrixShape[0]);
+  int64_t matrixNumCols = llvm::PowerOf2Ceil(originalMatrixShape[1]);
 
   if (matrixNumRows == matrixNumCols) {
     return summedShifts;
   }
 
-  // Post-processing partial-rotate-and-reduce step required for
-  // squat-diagonal packing.
   int64_t numShifts = (int64_t)(log2(matrixNumCols) - log2(matrixNumRows));
   if (unroll) {
     int64_t shift = matrixNumCols / 2;
@@ -590,6 +693,24 @@ implementHaleviShoup(const T& vector, const T& matrix,
         return NodeTy::yield({newSum, newShift});
       });
   return NodeTy::resultAt(loopNode, 0);
+}
+
+// Returns an arithmetic DAG that implements the Halevi-Shoup matrix
+// multiplication algorithm. This implementation uses a rotate-and-reduce
+// operation, followed by a summation of partial sums if the matrix is not
+// square.
+template <typename T>
+std::enable_if_t<std::is_base_of<AbstractValue, T>::value,
+                 std::shared_ptr<ArithmeticDagNode<T>>>
+implementHaleviShoup(const T& vector, const T& matrix,
+                     std::vector<int64_t> originalMatrixShape,
+                     const DagType& dagType,
+                     std::map<int, bool> zeroDiagonals = {},
+                     bool unroll = true) {
+  auto summedShifts = implementHaleviShoupDiagonalSum<T>(
+      vector, matrix, dagType, zeroDiagonals, unroll);
+  return implementSquatDiagonalFold<T>(summedShifts, originalMatrixShape,
+                                       dagType, unroll);
 }
 
 // Returns an arithmetic DAG that implements the bicyclic matrix multiplication

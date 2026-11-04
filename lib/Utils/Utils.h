@@ -9,12 +9,15 @@
 #include <utility>
 #include <vector>
 
+#include "llvm/include/llvm/ADT/APFloat.h"              // from @llvm-project
 #include "mlir/include/mlir/Dialect/Func/IR/FuncOps.h"  // from @llvm-project
 #include "mlir/include/mlir/IR/Attributes.h"            // from @llvm-project
 #include "mlir/include/mlir/IR/BuiltinAttributeInterfaces.h"  // from @llvm-project
 #include "mlir/include/mlir/IR/Dialect.h"          // from @llvm-project
 #include "mlir/include/mlir/IR/Location.h"         // from @llvm-project
+#include "mlir/include/mlir/IR/Matchers.h"         // from @llvm-project
 #include "mlir/include/mlir/IR/Operation.h"        // from @llvm-project
+#include "mlir/include/mlir/IR/TypeUtilities.h"    // from @llvm-project
 #include "mlir/include/mlir/IR/Types.h"            // from @llvm-project
 #include "mlir/include/mlir/IR/Value.h"            // from @llvm-project
 #include "mlir/include/mlir/IR/Visitors.h"         // from @llvm-project
@@ -170,6 +173,25 @@ bool containsArgumentOfType(Operation* op) {
   return containsArgumentOfType(op, TypeEqual<TypeTys...>());
 }
 
+// Returns true if the op contains argument types from the given dialects.
+template <typename... Dialects>
+bool containsArgumentOfDialect(Operation* op) {
+  auto predicate = [](Type type) {
+    return DialectEqual<Dialects...>()(
+        &getElementTypeOrSelf(type).getDialect());
+  };
+  if (auto funcOp = dyn_cast<func::FuncOp>(op)) {
+    return llvm::any_of(funcOp.getArgumentTypes(), predicate);
+  }
+  return llvm::any_of(op->getRegions(), [&](Region& region) {
+    return llvm::any_of(region.getBlocks(), [&](Block& block) {
+      return llvm::any_of(block.getArguments(), [&](BlockArgument arg) {
+        return predicate(arg.getType());
+      });
+    });
+  });
+}
+
 // A helper to iterate over the space of indices of a multidimensional tensor
 // whose shape is given by `shape`, passing each index tuple visited to
 // `process`.
@@ -213,6 +235,14 @@ inline std::pair<bool, bool> allZeroAllOne(ArrayRef<double> mask) {
     }
   }
   return {allZero, allOne};
+}
+
+/// Matches a constant scalar / vector splat / tensor splat float that is
+/// nonnegative and finite.
+inline ::mlir::detail::constant_float_predicate_matcher m_NonNegativeFloat() {
+  return {[](const APFloat& value) {
+    return !value.isNegative() && value.isFinite();
+  }};
 }
 
 /// Returns true if and only if all types in the given values are the same.

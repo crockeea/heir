@@ -231,7 +231,10 @@ class SecretGenericOpConversion
       secret::GenericOp op, TypeRange outputTypes, ValueRange inputs,
       ArrayRef<NamedAttribute> attributes,
       ContextAwareConversionPatternRewriter& rewriter) const {
-    return rewriter.replaceOpWithNewOp<Y>(op, outputTypes, inputs, attributes)
+    return rewriter
+        .replaceOpWithNewOp<Y>(op, outputTypes, inputs,
+                               typename Y::Properties{},
+                               /*discardableAttributes=*/attributes)
         .getOperation();
   }
 };
@@ -391,9 +394,12 @@ class SecretGenericOpLevelReduceConversion
       secret::GenericOp op, TypeRange outputTypes, ValueRange inputs,
       ArrayRef<NamedAttribute> attributes,
       ContextAwareConversionPatternRewriter& rewriter) const override {
-    auto innerOp =
-        cast<mgmt::LevelReduceOp>(op.getBody()->getOperations().front());
-    auto levelToDrop = innerOp.getLevelToDrop();
+    auto inputCtTy =
+        cast<lwe::LWECiphertextType>(getElementTypeOrSelf(inputs[0].getType()));
+    auto outputCtTy =
+        cast<lwe::LWECiphertextType>(getElementTypeOrSelf(outputTypes[0]));
+    int64_t levelToDrop = inputCtTy.getModulusChain().getCurrent() -
+                          outputCtTy.getModulusChain().getCurrent();
 
     auto newOp =
         rewriter.replaceOpWithNewOp<T>(op, outputTypes, inputs[0], levelToDrop);

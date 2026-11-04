@@ -1,4 +1,4 @@
-// RUN: heir-translate %s --emit-tfhe-rust --use-levels=False | FileCheck %s
+// RUN: heir-translate %s --emit-tfhe-rust --use-levels=false | FileCheck %s
 
 // CHECK: fn load_resource<T: Copy>(path: &str, size: usize) -> Vec<T> {
 // CHECK:   use std::fs::File;
@@ -47,7 +47,9 @@
 module {
   func.func @test_external_constant(%arg0: memref<4xi32>) -> memref<4xi32> {
     %c0 = arith.constant 0 : index
-    %0 = preprocessing.load_resource "some/path/constant_1.bin" : memref<4xi32>
+    %0 = memref.alloc() : memref<4xi32>
+    preprocessing.load_resource "some/path/constant_1.bin" into %0
+        : (memref<4xi32>) -> ()
     %res = memref.alloc() : memref<4xi32>
     %val0 = memref.load %arg0[%c0] : memref<4xi32>
     %val1 = memref.load %0[%c0] : memref<4xi32>
@@ -58,7 +60,9 @@ module {
 
   func.func @test_external_constant_i1(%arg0: memref<4xi1>) -> memref<4xi1> {
     %c0 = arith.constant 0 : index
-    %0 = preprocessing.load_resource "some/path/constant_i1.bin" : memref<4xi1>
+    %0 = memref.alloc() : memref<4xi1>
+    preprocessing.load_resource "some/path/constant_i1.bin" into %0
+        : (memref<4xi1>) -> ()
     %res = memref.alloc() : memref<4xi1>
     %val0 = memref.load %arg0[%c0] : memref<4xi1>
     %val1 = memref.load %0[%c0] : memref<4xi1>

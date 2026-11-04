@@ -35,7 +35,8 @@ LogicalResult BootstrapWaterlineAnalysis::visitOperation(
   }
 
   // 2. Compute prospective level
-  LevelState prospectiveLevel = deriveResultLevel(op, operandLevelStates);
+  LevelState prospectiveLevel =
+      deriveResultLevel(op, operandLevelStates, &solverRef);
   if (levelBudget > 0 && prospectiveLevel.isInt() &&
       prospectiveLevel.getInt() > levelBudget) {
     LLVM_DEBUG({
@@ -67,9 +68,10 @@ LogicalResult BootstrapWaterlineAnalysis::visitOperation(
     resultNeedsBootstrap = exceedsWaterline;
     if (exceedsWaterline) {
       if (auto reduceOp = dyn_cast<ReducesLevelOpInterface>(op)) {
-        resultLevel = LevelState(reduceOp.getLevelsToDrop());
+        resultLevel =
+            LevelState(bootstrapLevelsConsumed + reduceOp.getLevelsToDrop());
       } else {
-        resultLevel = LevelState(0);
+        resultLevel = LevelState(bootstrapLevelsConsumed);
       }
     } else {
       resultLevel = prospectiveLevel;
@@ -99,12 +101,12 @@ void BootstrapWaterlineAnalysis::visitExternalCall(
     CallOpInterface call,
     ArrayRef<const BootstrapWaterlineLattice*> argumentLattices,
     ArrayRef<BootstrapWaterlineLattice*> resultLattices) {
-  auto callback =
-      std::bind(&BootstrapWaterlineAnalysis::propagateIfChangedWrapper, this,
-                std::placeholders::_1, std::placeholders::_2);
   ::mlir::heir::visitExternalCall<BootstrapWaterlineState,
                                   BootstrapWaterlineLattice>(
-      call, argumentLattices, resultLattices, callback);
+      call, argumentLattices, resultLattices,
+      [this](AnalysisState* state, ChangeResult changed) {
+        this->propagateIfChanged(state, changed);
+      });
 }
 
 }  // namespace heir

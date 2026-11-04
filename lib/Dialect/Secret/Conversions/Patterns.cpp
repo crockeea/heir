@@ -2,14 +2,18 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 #include "lib/Dialect/Debug/IR/DebugOps.h"
 #include "lib/Dialect/LWE/IR/LWEAttributes.h"
 #include "lib/Dialect/LWE/IR/LWEDialect.h"
 #include "lib/Dialect/LWE/IR/LWEOps.h"
 #include "lib/Dialect/LWE/IR/LWETypes.h"
+#include "lib/Dialect/Mgmt/IR/MgmtDialect.h"
 #include "lib/Dialect/Mgmt/IR/MgmtOps.h"
+#include "lib/Dialect/ModArith/IR/ModArithTypes.h"
 #include "lib/Dialect/ModuleAttributes.h"
+#include "lib/Dialect/RNS/IR/RNSTypes.h"
 #include "lib/Dialect/Secret/IR/SecretDialect.h"
 #include "lib/Dialect/Secret/IR/SecretOps.h"
 #include "lib/Dialect/Secret/IR/SecretTypes.h"
@@ -86,10 +90,16 @@ LogicalResult ConvertClientConceal::lowerToTrivialEncryption(
 
   // Intentionally use op.getCleartext() because we don't want to type-convert
   // the input to a ciphertext.
+  IntegerAttr scaleAttr;
+  if (ctTy.getModulusChain()) {
+    scaleAttr =
+        rewriter.getI64IntegerAttr(lwe::getScalingFactorFromEncodingAttr(
+            ctTy.getPlaintextSpace().getEncoding()));
+  }
   auto encoded = lwe::RLWEEncodeOp::create(
       rewriter, op.getLoc(), encodeOpResultTy, op.getCleartext(),
       ctTy.getPlaintextSpace().getEncoding(),
-      ctTy.getPlaintextSpace().getRing());
+      ctTy.getPlaintextSpace().getRing(), /*level=*/nullptr, scaleAttr);
   auto newOp =
       lwe::TrivialEncryptOp::create(rewriter, op.getLoc(), resultTy, encoded);
   newOp->setAttrs(op->getAttrs());
@@ -145,11 +155,20 @@ LogicalResult ConvertClientConceal::matchAndRewrite(
   auto plaintextTy = lwe::LWEPlaintextType::get(op.getContext(),
                                                 resultCtTy.getPlaintextSpace());
 
+  // As above, --lwe-annotate-plaintext-level owns the level.
+  IntegerAttr encScaleAttr;
+  if (resultCtTy.getModulusChain()) {
+    encScaleAttr =
+        rewriter.getI64IntegerAttr(lwe::getScalingFactorFromEncodingAttr(
+            resultCtTy.getPlaintextSpace().getEncoding()));
+  }
+
   auto encryptFn = [&](Value cleartext) -> lwe::RLWEEncryptOp {
     auto encoded =
         lwe::RLWEEncodeOp::create(rewriter, op.getLoc(), plaintextTy, cleartext,
                                   resultCtTy.getPlaintextSpace().getEncoding(),
-                                  resultCtTy.getPlaintextSpace().getRing());
+                                  resultCtTy.getPlaintextSpace().getRing(),
+                                  /*level=*/nullptr, encScaleAttr);
     auto encryptOp = lwe::RLWEEncryptOp::create(
         rewriter, op.getLoc(), resultCtTy, encoded.getResult(), keyBlockArg);
     // Copy attributes from the original op to preserve any mgmt attrs needed by
@@ -196,9 +215,10 @@ LogicalResult ConvertClientReveal::matchAndRewrite(
     secret::RevealOp op, OpAdaptor adaptor,
     ContextAwareConversionPatternRewriter& rewriter) const {
   func::FuncOp parentFunc = op->getParentOfType<func::FuncOp>();
-  if (!parentFunc || !parentFunc->hasAttr(kClientDecFuncAttrName)) {
-    return op->emitError() << "expected to be inside a function with attribute "
-                           << kClientDecFuncAttrName;
+  if (!parentFunc || !hasInterfaceRole(parentFunc, kClientDecRole)) {
+    return op->emitError()
+           << "expected to be inside a function with interface role "
+           << kClientDecRole;
   }
 
   // The decryption func decrypts a single value, so it must have a single
@@ -533,6 +553,7 @@ void addSecretToSchemeDefaultConversionTargetsAndPatterns(
       SecretGenericOpConversion<debug::ValidateOp>, ConvertExtractSlice,
       ConvertInsertSlice, SecretGenericFuncCallConversion,
       SecretGenericOpConversion<tensor::EmptyOp, tensor::EmptyOp>,
+      SecretGenericOpConversion<tensor::PadOp, tensor::PadOp>,
       SecretGenericOpIdentityConversion<arith::ExtSIOp>,
       SecretGenericOpIdentityConversion<arith::ExtUIOp>,
       SecretGenericOpIdentityConversion<arith::FPToSIOp>,
@@ -542,6 +563,83 @@ void addSecretToSchemeDefaultConversionTargetsAndPatterns(
       typeConverter, patterns.getContext());
 
   addStructuralConversionPatterns(typeConverter, patterns, target);
+}
+
+SecretToRlweTypeConverter::SecretToRlweTypeConverter(
+    MLIRContext* ctx, polynomial::RingAttr rlweRing,
+    SmallVector<int32_t> moduliPerLevel)
+    : UniquelyNamedAttributeAwareTypeConverter(
+          mgmt::MgmtDialect::kArgMgmtAttrName),
+      ring(rlweRing),
+      moduliPerLevel(std::move(moduliPerLevel)) {
+  addConversion([](Type type, Attribute attr) -> std::optional<Type> {
+    if (isa<secret::SecretType>(type)) return std::nullopt;
+    return type;
+  });
+  addConversion([this](RankedTensorType type, mgmt::MgmtAttr mgmtAttr) -> Type {
+    // For cases like tensor.empty + mgmt.init, we need to convert this
+    // to a ciphertext type.
+    //
+    // Care must be taken to ensure that types that have already been
+    // converted (i.e., their element type is a ciphertext or plaintext
+    // type) are returned as-is, or else legality checking will consider
+    // ops with these types illegal.
+    if (isa<lwe::LWECiphertextType, lwe::LWEPlaintextType>(
+            type.getElementType()))
+      return type;
+    return convertSecretTypeWithMgmtAttr(secret::SecretType::get(type),
+                                         mgmtAttr);
+  });
+  addConversion([this](secret::SecretType type, mgmt::MgmtAttr mgmtAttr) {
+    return convertSecretTypeWithMgmtAttr(type, mgmtAttr);
+  });
+}
+
+Type SecretToRlweTypeConverter::convertSecretTypeWithMgmtAttr(
+    secret::SecretType type, mgmt::MgmtAttr mgmtAttr) const {
+  auto* ctx = type.getContext();
+  auto level = mgmtAttr.getLevel();
+  auto dimension = mgmtAttr.getDimension();
+  auto scale = mgmtAttr.getScale();
+  auto tensorValueType = dyn_cast<RankedTensorType>(type.getValueType());
+
+  SmallVector<IntegerAttr> modulusChain;
+  for (auto modArithType :
+       cast<rns::RNSType>(ring.getCoefficientType()).getBasisTypes()) {
+    auto modulus = cast<mod_arith::ModArithType>(modArithType).getModulus();
+    modulusChain.push_back(modulus);
+  }
+
+  auto plaintextRing = getPlaintextRing(ctx);
+  auto encodingAttr = getEncodingAttr(ctx, scale);
+  auto encryptionType = getEncryptionType();
+
+  auto levelRing = lwe::getRlweRNSRingWithLevel(ring, moduliPerLevel, level);
+  int currentModulusIdx = cast<rns::RNSType>(levelRing.getCoefficientType())
+                              .getBasisTypes()
+                              .size() -
+                          1;
+
+  auto ctType = lwe::LWECiphertextType::get(
+      ctx, lwe::PlaintextSpaceAttr::get(ctx, plaintextRing, encodingAttr),
+      lwe::CiphertextSpaceAttr::get(ctx, levelRing, encryptionType, dimension),
+      lwe::KeyAttr::get(ctx, 0),
+      lwe::ModulusChainAttr::get(ctx, modulusChain, currentModulusIdx));
+
+  if (tensorValueType) {
+    // A rank-1 tensor is interpreted as a single ciphertext
+    if (tensorValueType.getRank() == 1) {
+      return ctType;
+    }
+
+    // A rank-2+ tensor is a tensor of ciphertexts, where the last axis
+    // becomes the ciphertext type. This is the most common case where
+    // data is packed in a set of ciphertexts.
+    return RankedTensorType::get(tensorValueType.getShape().drop_back(),
+                                 ctType);
+  }
+
+  return ctType;
 }
 
 }  // namespace heir

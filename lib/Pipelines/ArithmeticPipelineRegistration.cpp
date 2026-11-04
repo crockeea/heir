@@ -6,9 +6,11 @@
 #include "lib/Dialect/BGV/Conversions/BGVToLWE/BGVToLWE.h"
 #include "lib/Dialect/CKKS/Transforms/CKKSToLWE.h"
 #include "lib/Dialect/Debug/Transforms/ValidateNames.h"
+#include "lib/Dialect/Kernel/Transforms/PrepareLinearTransforms.h"
 #include "lib/Dialect/LWE/Conversions/LWEToLattigo/LWEToLattigo.h"
 #include "lib/Dialect/LWE/Conversions/LWEToOpenfhe/LWEToOpenfhe.h"
 #include "lib/Dialect/LWE/Transforms/AddDebugPort.h"
+#include "lib/Dialect/LWE/Transforms/AnnotatePlaintextLevel.h"
 #include "lib/Dialect/LWE/Transforms/ImplementTrivialEncryptionAsAddition.h"
 #include "lib/Dialect/Lattigo/Transforms/AllocToInPlace.h"
 #include "lib/Dialect/Lattigo/Transforms/ConfigureCryptoContext.h"
@@ -47,6 +49,7 @@
 #include "lib/Transforms/ForwardInsertSliceToExtractSlice/ForwardInsertSliceToExtractSlice.h"
 #include "lib/Transforms/ForwardInsertToExtract/ForwardInsertToExtract.h"
 #include "lib/Transforms/FullLoopUnroll/FullLoopUnroll.h"
+#include "lib/Transforms/GatherZeroEncryptions/GatherZeroEncryptions.h"
 #include "lib/Transforms/GenerateParam/GenerateParam.h"
 #include "lib/Transforms/ILPBootstrapPlacement/ILPBootstrapPlacement.h"
 #include "lib/Transforms/InlineActivations/InlineActivations.h"
@@ -98,7 +101,6 @@ void hecoSIMDVectorizerPipelineBuilder(OpPassManager& manager,
                                        bool disableLoopUnroll) {
   // For now we unroll loops to enable insert-rotate, but we would like to be
   // smarter about this and do an affine loop analysis.
-  // TODO(#589): avoid unrolling loops
   if (!disableLoopUnroll) {
     manager.addPass(createFullLoopUnroll());
   }
@@ -165,6 +167,7 @@ void cleanupAfterLowerAssignLayout(OpPassManager& pm) {
   pm.addPass(createSCCPPass());
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
+  pm.addPass(createLoopInvariantCodeMotionPass());
   pm.addPass(createRemoveDeadValuesPass());
   pm.addPass(createSymbolDCEPass());
   pm.addPass(createCanonicalizerPass());
@@ -200,8 +203,8 @@ void mlirToSecretArithmeticPipelineBuilder(
 
   // Vectorize and optimize rotations
   // TODO(#2320): figure out where this fits in the new pipeline
-  hecoSIMDVectorizerPipelineBuilder(pm, options.experimentalDisableLoopUnroll);
-  mathToPolynomialApproximationBuilder(pm);
+  hecoSIMDVectorizerPipelineBuilder(pm, !options.unrollFheKernelLoops);
+  mathToPolynomialApproximationBuilder(pm, options.useCompositeRelu);
 
   // Layout assignment and optimization
   LayoutPropagationOptions layoutPropagationOptions;
@@ -213,11 +216,16 @@ void mlirToSecretArithmeticPipelineBuilder(
   // Layout conversions may be repeated, so run CSE
   pm.addPass(createCSEPass());
 
+  EarlyBootstrapPlacementOptions earlyBootstrapOptions;
+  earlyBootstrapOptions.levelBudget = options.greedyLevelBudget;
+  earlyBootstrapOptions.bootstrapWaterline = options.greedyBootstrapWaterline;
+  pm.addPass(createEarlyBootstrapPlacement(earlyBootstrapOptions));
+
   // Linalg kernel implementation
   ConvertToCiphertextSemanticsOptions convertToCiphertextSemanticsOptions;
   convertToCiphertextSemanticsOptions.minSlotCount = options.minSlotCount;
   convertToCiphertextSemanticsOptions.unrollKernels =
-      !options.experimentalDisableLoopUnroll;
+      options.unrollFheKernelLoops;
   convertToCiphertextSemanticsOptions.codegenStrategy = options.codegenStrategy;
   pm.addPass(
       createConvertToCiphertextSemantics(convertToCiphertextSemanticsOptions));
@@ -248,6 +256,7 @@ void mlirToPlaintextPipelineBuilder(OpPassManager& pm,
   // Convert to secret arithmetic
   MlirToRLWEPipelineOptions mlirToRLWEPipelineOptions;
   mlirToRLWEPipelineOptions.minSlotCount = options.plaintextSize;
+  mlirToRLWEPipelineOptions.unrollFheKernelLoops = options.unrollFheKernelLoops;
   mlirToSecretArithmeticPipelineBuilder(pm, mlirToRLWEPipelineOptions);
 
   // Insert debug handler calls and/or lower debug.validate
@@ -423,7 +432,7 @@ void mlirToRLWEPipeline(OpPassManager& pm,
   }
 
   // TODO(#2600): support loops in optimize-relinearization
-  if (!options.experimentalDisableLoopUnroll) {
+  if (options.unrollFheKernelLoops) {
     OptimizeRelinearizationOptions optimizeRelinearizationOptions;
     optimizeRelinearizationOptions.allowMixedDegreeOperands = false;
     pm.addPass(createOptimizeRelinearization(optimizeRelinearizationOptions));
@@ -489,6 +498,7 @@ void mlirToRLWEPipeline(OpPassManager& pm,
       generateParamOptions.scalingModBits = options.scalingModBits;
       generateParamOptions.minSlotCount = options.minSlotCount;
       generateParamOptions.usePublicKey = options.usePublicKey;
+      generateParamOptions.parameterFile = options.parameterFile;
       pm.addPass(createGenerateParamCKKS(generateParamOptions));
 
       PopulateScaleCKKSOptions populateScaleCKKSOptions;
@@ -540,11 +550,28 @@ void mlirToRLWEPipeline(OpPassManager& pm,
 
   pm.addPass(createForwardInsertToExtract());
   pm.addPass(createCanonicalizerPass());
+
+  // Record the level each plaintext is used at, so backends can encode only the
+  // limbs it needs. This must run before CSE, which could otherwise merge
+  // identical encode ops used at different levels (invalidating targets that
+  // require exact level matching).
+  pm.addPass(lwe::createAnnotatePlaintextLevel());
   pm.addPass(createCSEPass());
   pm.addPass(createSymbolDCEPass());
 
   // TODO(#2554): skip this pass if the backend supports trivial encryption
   pm.addPass(lwe::createImplementTrivialEncryptionAsAddition());
+
+  // Annotate levels again after trivial encryption is lowered to addition,
+  // which synthesizes fresh encode ops for zero-encryptions at lower levels.
+  // This must also run before split-preprocessing, which severs the use chain
+  // from an encode op to the ciphertext op consuming it.
+  pm.addPass(lwe::createAnnotatePlaintextLevel());
+
+  // Split each linear transform into a cleartext preparation (which
+  // split-preprocessing below hoists out of the hot path) and an application
+  // that only needs the ciphertext, for backends that support it.
+  pm.addPass(kernel::createPrepareLinearTransforms());
 
   // Add a __preprocessed helper for offline pre-packing of plaintexts
   if (options.enableSplitPreprocessing) {
@@ -553,7 +580,7 @@ void mlirToRLWEPipeline(OpPassManager& pm,
   }
 
   ElementwiseToAffineOptions elementwiseOptions;
-  elementwiseOptions.convertDialects = {"ckks", "bgv", "lwe"};
+  elementwiseOptions.convertDialects = {"ckks", "bgv", "lwe", "kernel"};
   pm.addPass(createElementwiseToAffine(elementwiseOptions));
 
   pm.addPass(tensor_ext::createTensorExtToTensor());
@@ -577,36 +604,51 @@ RLWEPipelineBuilder mlirToRLWEPipelineBuilder(const RLWEScheme scheme) {
   };
 }
 
+static void addRLWELoweringPasses(OpPassManager& pm,
+                                  const BackendOptions& options) {
+  // Convert to (common trivial subset of) LWE
+  // TODO (#1193): Replace `--bgv-to-lwe` with `--bgv-common-to-lwe`
+  pm.addPass(bgv::createBGVToLWE());
+  pm.addPass(ckks::createCKKSToLWE());
+
+  if (!extConstOutputDir.empty()) {
+    ExternalizeConstantsOptions extConstOptions;
+    extConstOptions.outputDir = extConstOutputDir;
+    extConstOptions.runtimeLoadDir = extConstRuntimeLoadDir;
+    extConstOptions.thresholdElements = extConstThreshold;
+    pm.addPass(createExternalizeConstants(extConstOptions));
+  }
+
+  // insert debug handler calls
+  lwe::AddDebugPortOptions addDebugPortOptions{
+      .entryFunction = options.entryFunction,
+      .insertDebugAfterEveryOp = options.debug,
+  };
+  pm.addPass(lwe::createAddDebugPort(addDebugPortOptions));
+}
+
+static void addCleanupPasses(OpPassManager& pm) {
+  pm.addPass(createRemoveUnusedPureCall());
+  pm.addPass(createRemoveDeadValuesPass());
+  pm.addPass(createCSEPass());
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createSymbolDCEPass());
+}
+
 BackendPipelineBuilder toOpenFhePipelineBuilder() {
   return [=](OpPassManager& pm, const BackendOptions& options) {
     // Canonicalize to ensure the ciphertext operands are in the first operand
     // of ct-pt ops.
     pm.addPass(createCanonicalizerPass());
 
-    // Convert the common trivial subset of CKKS/BGV to LWE
-    pm.addPass(bgv::createBGVToLWE());
-    pm.addPass(ckks::createCKKSToLWE());
-
-    if (!extConstOutputDir.empty()) {
-      ExternalizeConstantsOptions extConstOptions;
-      extConstOptions.outputDir = extConstOutputDir;
-      extConstOptions.runtimeLoadDir = extConstRuntimeLoadDir;
-      extConstOptions.thresholdElements = extConstThreshold;
-      pm.addPass(createExternalizeConstants(extConstOptions));
-    }
-
-    // insert debug handler calls
-    lwe::AddDebugPortOptions addDebugPortOptions{
-        .entryFunction = options.entryFunction,
-        .insertDebugAfterEveryOp = options.debug,
-    };
-    pm.addPass(lwe::createAddDebugPort(addDebugPortOptions));
+    addRLWELoweringPasses(pm, options);
 
     // Convert LWE (and scheme-specific CKKS/BGV ops) to OpenFHE
     pm.addPass(lwe::createLWEToOpenfhe());
     pm.addPass(preprocessing::createPreprocessingToOpenfhe());
     pm.addPass(createCanonicalizerPass());
     pm.addPass(createCSEPass());
+    pm.addPass(createGatherZeroEncryptions());
 
     auto configureCryptoContextOptions =
         openfhe::ConfigureCryptoContextOptions{};
@@ -629,35 +671,13 @@ BackendPipelineBuilder toOpenFhePipelineBuilder() {
     pm.addPass(createCSEPass());
     pm.addPass(openfhe::createAllocToInPlace());
 
-    pm.addPass(createRemoveUnusedPureCall());
-    pm.addPass(createRemoveDeadValuesPass());
-    pm.addPass(createCSEPass());
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createSymbolDCEPass());
+    addCleanupPasses(pm);
   };
 }
 
 BackendPipelineBuilder toLattigoPipelineBuilder() {
   return [=](OpPassManager& pm, const BackendOptions& options) {
-    // Convert to (common trivial subset of) LWE
-    // TODO (#1193): Replace `--bgv-to-lwe` with `--bgv-common-to-lwe`
-    pm.addPass(bgv::createBGVToLWE());
-    pm.addPass(ckks::createCKKSToLWE());
-
-    if (!extConstOutputDir.empty()) {
-      ExternalizeConstantsOptions extConstOptions;
-      extConstOptions.outputDir = extConstOutputDir;
-      extConstOptions.runtimeLoadDir = extConstRuntimeLoadDir;
-      extConstOptions.thresholdElements = extConstThreshold;
-      pm.addPass(createExternalizeConstants(extConstOptions));
-    }
-
-    // insert debug handler calls
-    lwe::AddDebugPortOptions addDebugPortOptions{
-        .entryFunction = options.entryFunction,
-        .insertDebugAfterEveryOp = options.debug,
-    };
-    pm.addPass(lwe::createAddDebugPort(addDebugPortOptions));
+    addRLWELoweringPasses(pm, options);
 
     // Convert LWE (and scheme-specific BGV ops) to Lattigo
     pm.addPass(lwe::createLWEToLattigo());
@@ -676,14 +696,12 @@ BackendPipelineBuilder toLattigoPipelineBuilder() {
     pm.addPass(
         lattigo::createConfigureCryptoContext(configureCryptoContextOptions));
 
-    pm.addPass(createRemoveUnusedPureCall());
-    pm.addPass(createCSEPass());
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createSymbolDCEPass());
+    addCleanupPasses(pm);
 
     // Bufferize without deallocation because golang has garbage collection.
     prepareForBufferize(pm);
     oneShotBufferize(pm, /*includeDeallocation=*/false);
+    pm.addPass(createGatherZeroEncryptions());
 
     // Lower Linalg to loops
     pm.addNestedPass<func::FuncOp>(createConvertLinalgToLoopsPass());
@@ -715,11 +733,11 @@ void torchLinalgToCkksBuilder(OpPassManager& manager,
   suboptions.enableArithmetization = true;
   suboptions.minSlotCount = options.minSlotCount;
   suboptions.greedyBootstrapWaterline = options.greedyBootstrapWaterline;
+  suboptions.useCompositeRelu = options.useCompositeRelu;
   suboptions.scalingModBits = options.scalingModBits;
   suboptions.firstModBits = options.firstModBits;
   suboptions.enableSplitPreprocessing = options.enableSplitPreprocessing;
-  suboptions.experimentalDisableLoopUnroll =
-      options.experimentalDisableLoopUnroll;
+  suboptions.unrollFheKernelLoops = options.unrollFheKernelLoops;
   suboptions.usePublicKey = options.usePublicKey;
   suboptions.encryptionTechniqueExtended = options.encryptionTechniqueExtended;
   suboptions.greedyModulusSwitchAfterMul = options.greedyModulusSwitchAfterMul;
@@ -733,6 +751,7 @@ void torchLinalgToCkksBuilder(OpPassManager& manager,
   suboptions.plaintextExecutionResultFileName =
       options.plaintextExecutionResultFileName;
   suboptions.codegenStrategy = options.codegenStrategy;
+  suboptions.parameterFile = options.parameterFile;
 
   mlirToRLWEPipelineBuilder(mlir::heir::RLWEScheme::ckksScheme)(manager,
                                                                 suboptions);

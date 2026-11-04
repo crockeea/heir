@@ -15,11 +15,19 @@ module attributes {backend.lattigo, scheme.ckks} {
   // CHECK: func.func @pooling
   // ROLL: func.func @pooling
   // ROLL: func.call @_assign_layout
-  // ROLL-COUNT-2: scf.for
-  // ROLL: scf.if
-  // ROLL: scf.for
+  // Rolled kernels do not need a rotation loop here either: the transform stays
+  // a single compact op that the backend evaluates directly, so the scf.for /
+  // scf.if nest the expanded form required is gone.
+  // ROLL: tensor_ext.rotate_and_reduce
+  // ROLL-SAME: tensor_ext.lintrans
 
-  // CHECK-COUNT-65: tensor_ext.rotate
+  // The Halevi-Shoup transform stays compact for a backend that can evaluate a
+  // linear transform directly: one rotate_and_reduce carrying the diagonals,
+  // where the expanded rotate/multiply/accumulate form needed 65 rotations. The
+  // rotations that remain are the squat-packing post-reduction (the packing has
+  // fewer rows than columns), not part of the transform itself.
+  // CHECK: tensor_ext.rotate_and_reduce
+  // CHECK-SAME: tensor_ext.lintrans
   // CHECK: return
 
   func.func @pooling(%arg0: !secret.secret<tensor<1x4x28x28xf32>> {tensor_ext.layout = #layout1}) -> (!secret.secret<tensor<1x4x14x14xf32>> {tensor_ext.layout = #layout}) {
@@ -27,8 +35,8 @@ module attributes {backend.lattigo, scheme.ckks} {
     %cst_0 = arith.constant dense<[[[[2.500000e-01, 2.500000e-01], [2.500000e-01, 2.500000e-01]], [[0.000000e+00, 0.000000e+00], [0.000000e+00, 0.000000e+00]], [[0.000000e+00, 0.000000e+00], [0.000000e+00, 0.000000e+00]], [[0.000000e+00, 0.000000e+00], [0.000000e+00, 0.000000e+00]]], [[[0.000000e+00, 0.000000e+00], [0.000000e+00, 0.000000e+00]], [[2.500000e-01, 2.500000e-01], [2.500000e-01, 2.500000e-01]], [[0.000000e+00, 0.000000e+00], [0.000000e+00, 0.000000e+00]], [[0.000000e+00, 0.000000e+00], [0.000000e+00, 0.000000e+00]]], [[[0.000000e+00, 0.000000e+00], [0.000000e+00, 0.000000e+00]], [[0.000000e+00, 0.000000e+00], [0.000000e+00, 0.000000e+00]], [[2.500000e-01, 2.500000e-01], [2.500000e-01, 2.500000e-01]], [[0.000000e+00, 0.000000e+00], [0.000000e+00, 0.000000e+00]]], [[[0.000000e+00, 0.000000e+00], [0.000000e+00, 0.000000e+00]], [[0.000000e+00, 0.000000e+00], [0.000000e+00, 0.000000e+00]], [[0.000000e+00, 0.000000e+00], [0.000000e+00, 0.000000e+00]], [[2.500000e-01, 2.500000e-01], [2.500000e-01, 2.500000e-01]]]]> : tensor<4x4x2x2xf32>
     %0 = secret.generic(%arg0: !secret.secret<tensor<1x4x28x28xf32>> {tensor_ext.layout = #layout1}) {
     ^body(%input0: tensor<1x4x28x28xf32>):
-      %1 = tensor_ext.assign_layout %cst {layout = #layout2, tensor_ext.layout = #layout2} : tensor<1x4x14x14xf32>
-      %2 = tensor_ext.assign_layout %cst_0 {layout = [#layout3, #layout4, #layout5, #layout6, #layout7], tensor_ext.layout = #layout8} : tensor<4x4x2x2xf32>
+      %1 = tensor_ext.assign_layout %cst <layout = #layout2> {tensor_ext.layout = #layout2} : tensor<1x4x14x14xf32>
+      %2 = tensor_ext.assign_layout %cst_0 <layout = [#layout3, #layout4, #layout5, #layout6, #layout7]> {tensor_ext.layout = #layout8} : tensor<4x4x2x2xf32>
       %3 = linalg.conv_2d_nchw_fchw {dilations = dense<1> : vector<2xi64>, secret.kernel = #kernel, strides = dense<2> : vector<2xi64>, tensor_ext.layout = #layout} ins(%input0, %2 : tensor<1x4x28x28xf32>, tensor<4x4x2x2xf32>) outs(%1 : tensor<1x4x14x14xf32>) -> tensor<1x4x14x14xf32>
       secret.yield %3 : tensor<1x4x14x14xf32>
     } -> (!secret.secret<tensor<1x4x14x14xf32>> {tensor_ext.layout = #layout})

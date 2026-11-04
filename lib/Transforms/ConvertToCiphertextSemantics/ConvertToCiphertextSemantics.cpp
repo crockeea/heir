@@ -1,6 +1,8 @@
 #include "lib/Transforms/ConvertToCiphertextSemantics/ConvertToCiphertextSemantics.h"
 
+#include <cassert>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -11,6 +13,8 @@
 #include <utility>
 #include <vector>
 
+#include "lib/Dialect/Kernel/IR/KernelOps.h"
+#include "lib/Dialect/Mgmt/IR/MgmtOps.h"
 #include "lib/Dialect/ModuleAttributes.h"
 #include "lib/Dialect/Secret/IR/SecretAttributes.h"
 #include "lib/Dialect/Secret/IR/SecretDialect.h"
@@ -25,6 +29,7 @@
 #include "lib/Kernel/KernelImplementation.h"
 #include "lib/Kernel/KernelName.h"
 #include "lib/Kernel/Utils.h"
+#include "lib/Target/CompilationTarget/CompilationTarget.h"
 #include "lib/Transforms/ConvertToCiphertextSemantics/AssignLayout.h"
 #include "lib/Transforms/ConvertToCiphertextSemantics/TypeConversion.h"
 #include "lib/Transforms/DropUnitDims/DropUnitDims.h"
@@ -55,14 +60,16 @@
 #include "mlir/include/mlir/Dialect/Tensor/IR/Tensor.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/Tensor/Transforms/Transforms.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/Utils/StaticValueUtils.h"  // from @llvm-project
-#include "mlir/include/mlir/IR/AffineExpr.h"             // from @llvm-project
-#include "mlir/include/mlir/IR/AffineMap.h"              // from @llvm-project
-#include "mlir/include/mlir/IR/Attributes.h"             // from @llvm-project
-#include "mlir/include/mlir/IR/Builders.h"               // from @llvm-project
+#include "mlir/include/mlir/IR/AffineExpr.h"  // from @llvm-project
+#include "mlir/include/mlir/IR/AffineMap.h"   // from @llvm-project
+#include "mlir/include/mlir/IR/Attributes.h"  // from @llvm-project
+#include "mlir/include/mlir/IR/Builders.h"    // from @llvm-project
+#include "mlir/include/mlir/IR/BuiltinAttributeInterfaces.h"  // from @llvm-project
 #include "mlir/include/mlir/IR/BuiltinAttributes.h"      // from @llvm-project
 #include "mlir/include/mlir/IR/BuiltinOps.h"             // from @llvm-project
 #include "mlir/include/mlir/IR/BuiltinTypeInterfaces.h"  // from @llvm-project
 #include "mlir/include/mlir/IR/BuiltinTypes.h"           // from @llvm-project
+#include "mlir/include/mlir/IR/Matchers.h"               // from @llvm-project
 #include "mlir/include/mlir/IR/OpDefinition.h"           // from @llvm-project
 #include "mlir/include/mlir/IR/OperationSupport.h"       // from @llvm-project
 #include "mlir/include/mlir/IR/PatternMatch.h"           // from @llvm-project
@@ -81,11 +88,14 @@ namespace heir {
 namespace {
 using kernel::ArithmeticDagNode;
 using kernel::implementHaleviShoup;
+using kernel::implementSquatDiagonalFold;
 using kernel::IRMaterializingVisitor;
 using kernel::SSAValue;
 using ::mlir::heir::kernel::ArithmeticDagNode;
+using ::mlir::heir::kernel::implementBroadcastedReduce;
 using ::mlir::heir::kernel::implementHaleviShoup;
 using ::mlir::heir::kernel::implementRotateAndReduce;
+using ::mlir::heir::kernel::implementSquatDiagonalFold;
 using ::mlir::heir::kernel::IRMaterializingVisitor;
 using ::mlir::heir::kernel::SSAValue;
 using presburger::IntegerRelation;
@@ -137,6 +147,7 @@ IntegerRelation restrictRelationToSlice(const IntegerRelation& relation,
 Operation* remapAndExtractResult(ImplicitLocOpBuilder& builder, Value input,
                                  LayoutAttr resultLayout,
                                  RankedTensorType resultType) {
+  assert(resultType.getRank() == 2 && "Expected 2D ciphertext semantic type");
   auto remapOp = tensor_ext::RemapOp::create(builder, input, resultLayout);
 
   SmallVector<OpFoldResult> strides(2, builder.getIndexAttr(1));
@@ -147,6 +158,27 @@ Operation* remapAndExtractResult(ImplicitLocOpBuilder& builder, Value input,
   auto extractRemap = tensor::ExtractSliceOp::create(
       builder, resultType, remapOp.getResult(), offsets, sizes, strides);
   return extractRemap;
+}
+
+// Rebuilds the full periodic layout of a kernel's output from the valid prefix
+// of the periodic pattern. Greedily replicates the valid periodic prefix of the
+// layout until the all of the slot count is covered.
+Operation* replicateValidPrefixOfResult(ImplicitLocOpBuilder& b, Value input,
+                                        LayoutAttr resultLayout,
+                                        int64_t inputPeriod,
+                                        int64_t validPrefix) {
+  auto ctSemanticType = cast<RankedTensorType>(input.getType());
+  int64_t numCiphertexts = ctSemanticType.getDimSize(0);
+  int64_t numSlots = ctSemanticType.getDimSize(1);
+  int64_t actualValidPrefix =
+      validPrefix > 0 ? (validPrefix / inputPeriod) * inputPeriod : 0;
+  IntegerRelation replication = getPeriodicReplicationRelation(
+      numCiphertexts, numSlots, actualValidPrefix);
+  LayoutAttr replicationMapping =
+      LayoutAttr::getFromIntegerRelation(b.getContext(), replication);
+  auto remapOp = tensor_ext::RemapOp::create(b, input, replicationMapping);
+  remapOp->setAttr(kLayoutAttrName, resultLayout);
+  return remapOp;
 }
 
 }  // namespace
@@ -483,10 +515,10 @@ class ConvertAssignLayout
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(module.getBody());
     auto func = func::FuncOp::create(rewriter, loc, funcName, funcType);
-    func->setAttr(kClientPackFuncAttrName,
-                  rewriter.getDictionaryAttr({rewriter.getNamedAttr(
-                      kClientHelperFuncName,
-                      rewriter.getStringAttr(originalFunc.getSymName()))}));
+    setInterfaceRole(func, kClientPackRole,
+                     rewriter.getDictionaryAttr({rewriter.getNamedAttr(
+                         kClientHelperFuncName,
+                         rewriter.getStringAttr(originalFunc.getSymName()))}));
     func.setPrivate();
 
     Block* funcBlock = func.addEntryBlock();
@@ -749,6 +781,96 @@ class ConvertLinalgReduce : public ConversionBase<linalg::ReduceOp> {
   }
 };
 
+class ConvertBroadcastedReduce
+    : public ConversionBase<tensor_ext::BroadcastedReduceOp> {
+ public:
+  using ConversionBase<tensor_ext::BroadcastedReduceOp>::ConversionBase;
+
+  LogicalResult matchAndRewrite(
+      tensor_ext::BroadcastedReduceOp op, OpAdaptor adaptor,
+      ContextAwareConversionPatternRewriter& rewriter) const final {
+    Value input = op.getTensor();
+    auto inputType = cast<RankedTensorType>(input.getType());
+    auto shape = inputType.getShape();
+    int64_t rank = inputType.getRank();
+    int64_t dim = op.getDimension();
+
+    // Extract B (block size = size of dimension)
+    int64_t B = shape[dim];
+
+    // Extract period (stride = product of subsequent dimensions)
+    int64_t period = 1;
+    for (int64_t i = dim + 1; i < rank; ++i) {
+      period *= shape[i];
+    }
+
+    // Get N (ciphertext size) from type converter
+    auto* typeConverter =
+        static_cast<const LayoutMaterializationTypeConverter*>(
+            getTypeConverter());
+    int64_t N = typeConverter->getCiphertextSize();
+
+    SSAValue vectorLeaf(adaptor.getTensor());
+    kernel::DagType dagType = kernel::mlirTypeToDagType(inputType);
+
+    auto vectorDag = kernel::ArithmeticDagNode<SSAValue>::leaf(vectorLeaf);
+
+    auto layoutAttr = cast<LayoutAttr>(op->getAttr(kLayoutAttrName));
+    auto convertedType = getTypeConverter()->convertType(inputType, layoutAttr);
+    auto convertedTensorType = cast<RankedTensorType>(convertedType);
+
+    std::optional<std::shared_ptr<kernel::ArithmeticDagNode<SSAValue>>>
+        cleanupMaskDag;
+    if (N > B * period) {
+      // Generate cleanup mask
+      Type elementType = convertedTensorType.getElementType();
+      int64_t numElements = convertedTensorType.getNumElements();
+      SmallVector<Attribute> maskValues;
+      maskValues.reserve(numElements);
+
+      for (int64_t i = 0; i < numElements; ++i) {
+        int64_t slot = i % N;
+        bool isOne = (slot % (B * period)) >= (B - 1) * period;
+        if (auto intType = dyn_cast<IntegerType>(elementType)) {
+          maskValues.push_back(
+              rewriter.getIntegerAttr(elementType, isOne ? 1 : 0));
+        } else if (auto floatType = dyn_cast<FloatType>(elementType)) {
+          maskValues.push_back(
+              rewriter.getFloatAttr(elementType, isOne ? 1.0 : 0.0));
+        } else {
+          return rewriter.notifyMatchFailure(op, "unsupported element type");
+        }
+      }
+
+      auto maskAttr = DenseElementsAttr::get(convertedTensorType, maskValues);
+      auto maskConst = arith::ConstantOp::create(rewriter, op.getLoc(),
+                                                 convertedTensorType, maskAttr);
+      cleanupMaskDag = kernel::ArithmeticDagNode<SSAValue>::leaf(
+          SSAValue(maskConst.getResult()));
+    }
+
+    std::string reduceOpName = "arith.addi";
+    if (op.getReduceOp().has_value()) {
+      reduceOpName = op.getReduceOp().value().str();
+      if (!StringRef(reduceOpName).starts_with("arith.")) {
+        reduceOpName = "arith." + reduceOpName;
+      }
+    }
+
+    auto implementedKernel = implementBroadcastedReduce(
+        vectorDag, cleanupMaskDag, period, B, N, dagType, reduceOpName,
+        /*unroll=*/true);
+
+    rewriter.setInsertionPointAfter(op);
+
+    Value finalOutput = materializeKernel(
+        rewriter, op.getLoc(), implementedKernel, convertedType, layoutAttr);
+
+    rewriter.replaceOp(op, finalOutput);
+    return success();
+  }
+};
+
 struct ConvertLinalgDot : public ConversionBase<linalg::DotOp> {
  public:
   using ConversionBase<linalg::DotOp>::ConversionBase;
@@ -802,6 +924,146 @@ struct ConvertLinalgDot : public ConversionBase<linalg::DotOp> {
   }
 };
 
+// Lowers linalg.broadcast under bicyclic or tricyclic packing where the
+// broadcast acts as a zero-cost view without moving ciphertext data.
+class ConvertLinalgBroadcast
+    : public ContextAwareOpConversionPattern<linalg::BroadcastOp> {
+ public:
+  using ContextAwareOpConversionPattern<
+      linalg::BroadcastOp>::ContextAwareOpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      linalg::BroadcastOp op, OpAdaptor adaptor,
+      ContextAwareConversionPatternRewriter& rewriter) const final {
+    auto resultLayout =
+        dyn_cast_or_null<LayoutAttr>(op->getAttr(kLayoutAttrName));
+    if (!resultLayout) {
+      return rewriter.notifyMatchFailure(op,
+                                         "op has no assigned layout attribute");
+    }
+
+    auto layoutLookup =
+        getTypeConverter()->getContextualAttr(adaptor.getInput());
+    if (failed(layoutLookup)) {
+      return rewriter.notifyMatchFailure(
+          op, "input layout not found in contextual type converter");
+    }
+    auto inputLayout = dyn_cast<LayoutAttr>(layoutLookup.value());
+    if (!inputLayout) {
+      return rewriter.notifyMatchFailure(
+          op, "input contextual attribute is not a LayoutAttr");
+    }
+
+    auto inputType = cast<RankedTensorType>(op.getInput().getType());
+    auto resultType = cast<RankedTensorType>(op->getResult(0).getType());
+    auto inputCtType = cast<RankedTensorType>(adaptor.getInput().getType());
+    int64_t numSlots = inputCtType.getShape().back();
+
+    Type convertedResultType = getTypeConverter()->convertType(
+        op->getResult(0).getType(), resultLayout);
+    if (!convertedResultType) {
+      return rewriter.notifyMatchFailure(
+          op, "failed to convert result type with result layout");
+    }
+
+    // If both input and result layouts are cyclic layouts, the ciphertext
+    // already holds the broadcast data in the correct slots.
+    if (isRelationCyclic(inputType, numSlots,
+                         inputLayout.getIntegerRelation()) &&
+        isRelationCyclic(resultType, numSlots,
+                         resultLayout.getIntegerRelation())) {
+      if (convertedResultType != adaptor.getInput().getType()) {
+        return rewriter.notifyMatchFailure(
+            op, "converted result ciphertext type does not match input type");
+      }
+      auto castOp = UnrealizedConversionCastOp::create(
+          rewriter, op.getLoc(), convertedResultType, adaptor.getInput());
+      setMaterializedAttr(castOp);
+      setAttributeAssociatedWith(castOp.getResult(0), kLayoutAttrName,
+                                 resultLayout);
+      rewriter.replaceOp(op, castOp);
+      return success();
+    }
+
+    // Lowering of non-cyclic broadcasts is postponed to a dedicated broadcast
+    // kernel (e.g. https://github.com/google/heir/pull/3163)
+    return rewriter.notifyMatchFailure(
+        op, "non-cyclic broadcasts are not supported yet");
+  }
+};
+
+// A linalg.transpose whose result layout was derived by layout propagation
+// (the input relation with permuted domain variables) packs to the exact
+// same ciphertext contents as its input; at ciphertext semantics the op is
+// a no-op forward, like the broadcast above.
+class ConvertLinalgTranspose
+    : public ContextAwareOpConversionPattern<linalg::TransposeOp> {
+ public:
+  using ContextAwareOpConversionPattern<
+      linalg::TransposeOp>::ContextAwareOpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      linalg::TransposeOp op, OpAdaptor adaptor,
+      ContextAwareConversionPatternRewriter& rewriter) const final {
+    auto resultLayout =
+        dyn_cast_or_null<LayoutAttr>(op->getAttr(kLayoutAttrName));
+    if (!resultLayout) {
+      return rewriter.notifyMatchFailure(op,
+                                         "op has no assigned layout attribute");
+    }
+
+    auto layoutLookup =
+        getTypeConverter()->getContextualAttr(adaptor.getInput());
+    if (failed(layoutLookup)) {
+      return rewriter.notifyMatchFailure(
+          op, "input layout not found in contextual type converter");
+    }
+    auto inputLayout = dyn_cast<LayoutAttr>(layoutLookup.value());
+    if (!inputLayout) {
+      return rewriter.notifyMatchFailure(
+          op, "input contextual attribute is not a LayoutAttr");
+    }
+
+    // Verify the transpose relation proof: the result relation must be equal
+    // to the expected permuted input relation.
+    IntegerRelation expectedRel = getTransposedRelation(
+        inputLayout.getIntegerRelation(), op.getPermutation());
+    if (!isRelationEqual(resultLayout.getIntegerRelation(), expectedRel)) {
+      return rewriter.notifyMatchFailure(
+          op,
+          "result layout relation is not equal to the expected transpose "
+          "relation");
+    }
+
+    Type convertedResultType = getTypeConverter()->convertType(
+        op->getResult(0).getType(), resultLayout);
+    if (!convertedResultType) {
+      return rewriter.notifyMatchFailure(
+          op, "failed to convert result type with result layout");
+    }
+    if (convertedResultType != adaptor.getInput().getType()) {
+      return rewriter.notifyMatchFailure(
+          op, "converted result ciphertext type does not match input type");
+    }
+    // Persist the result layout on a no-op cast so it can create a new
+    // SSA value that can be annotated with a new layout attribute. A bare
+    // forward leaves downstream consumers looking up the INPUT's contextual
+    // layout, whose domain order predates the transpose.
+    auto castOp = UnrealizedConversionCastOp::create(
+        rewriter, op.getLoc(), convertedResultType, adaptor.getInput());
+    setMaterializedAttr(castOp);
+    setAttributeAssociatedWith(castOp.getResult(0), kLayoutAttrName,
+                               resultLayout);
+    rewriter.replaceOp(op, castOp);
+    return success();
+  }
+};
+static Value emitCompactLinearTransform(
+    ContextAwareConversionPatternRewriter& rewriter, Location loc,
+    TypedValue<RankedTensorType> input, TypedValue<RankedTensorType> matrix,
+    ArrayRef<int64_t> matrixShape, Attribute layoutAttr,
+    const std::map<int, bool>& zeroDiagonals);
+
 struct ConvertLinalgMatvecLayout : public ConversionBase<linalg::MatvecOp> {
  public:
   using ConversionBase<linalg::MatvecOp>::ConversionBase;
@@ -845,6 +1107,20 @@ struct ConvertLinalgMatvecLayout : public ConversionBase<linalg::MatvecOp> {
     LLVM_DEBUG(llvm::dbgs()
                << "Got " << zeroDiagonals.size()
                << " zero diagonals for filter: " << matrix << "\n");
+
+    // Backends that evaluate a linear transform directly take the compact
+    // form, exactly as the convolution paths do.
+    auto target = getTargetConfig(op->getParentOfType<ModuleOp>());
+    Attribute resultLayout = op->getAttr(kLayoutAttrName);
+    if (resultLayout && succeeded(target) && target->hasKernelLinearTransform) {
+      Value compact = emitCompactLinearTransform(
+          rewriter, op.getLoc(), input, matrix,
+          cast<RankedTensorType>(op.getInputs()[0].getType()).getShape(),
+          resultLayout, zeroDiagonals);
+      addBiasAndReplace(rewriter, op, compact, adaptor.getOutputs()[0],
+                        resultLayout);
+      return;
+    }
 
     auto dagType = kernel::mlirTypeToDagType(input.getType());
     std::shared_ptr<ArithmeticDagNode<SSAValue>> implementedKernel =
@@ -891,6 +1167,245 @@ struct ConvertLinalgMatvecLayout : public ConversionBase<linalg::MatvecOp> {
  private:
   bool unrollKernels;
 };
+
+// Returns a reader for the elements of a constant tensor, by flat row-major
+// index, or an empty function when the constant cannot be read.
+//
+// Supports both DenseElementsAttr and DenseF{32,64}ResourceElementsAttr.
+std::function<Attribute(int64_t)> constantElementReader(
+    ElementsAttr elementsAttr) {
+  if (auto valuesBegin = elementsAttr.try_value_begin<Attribute>()) {
+    return
+        [begin = *valuesBegin](int64_t i) -> Attribute { return *(begin + i); };
+  }
+  auto floatType = dyn_cast<FloatType>(elementsAttr.getElementType());
+  if (!floatType) return nullptr;
+  if (auto resource = dyn_cast<DenseF32ResourceElementsAttr>(elementsAttr)) {
+    if (auto data = resource.tryGetAsArrayRef()) {
+      return [data = *data, floatType](int64_t i) -> Attribute {
+        return FloatAttr::get(floatType, data[i]);
+      };
+    }
+  } else if (auto resource =
+                 dyn_cast<DenseF64ResourceElementsAttr>(elementsAttr)) {
+    if (auto data = resource.tryGetAsArrayRef()) {
+      return [data = *data, floatType](int64_t i) -> Attribute {
+        return FloatAttr::get(floatType, data[i]);
+      };
+    }
+  }
+  return nullptr;
+}
+
+struct PreserveLinalgMatvecAsLinearTransform
+    : public ConversionBase<linalg::MatvecOp> {
+ public:
+  using ConversionBase<linalg::MatvecOp>::ConversionBase;
+
+  PreserveLinalgMatvecAsLinearTransform(
+      const ContextAwareTypeConverter& typeConverter, MLIRContext* context)
+      : ConversionBase<linalg::MatvecOp>(typeConverter, context,
+                                         /*benefit=*/20) {}
+
+  LogicalResult matchAndRewrite(
+      linalg::MatvecOp op, OpAdaptor adaptor,
+      ContextAwareConversionPatternRewriter& rewriter) const final {
+    auto target = getTargetConfig(op->getParentOfType<ModuleOp>());
+    if (failed(target) || !target->hasKernelLinearTransform) {
+      return rewriter.notifyMatchFailure(op, "linear transform not enabled");
+    }
+
+    Value matrixOperand = op.getInputs()[0];
+    LayoutAttr matrixLayout = getLayoutAttr(matrixOperand);
+    if (!matrixLayout) {
+      return rewriter.notifyMatchFailure(op, "missing layout for matrix");
+    }
+
+    Value matrix = matrixOperand;
+    if (auto assignLayoutOp =
+            matrix.getDefiningOp<tensor_ext::AssignLayoutOp>()) {
+      matrix = assignLayoutOp.getValue();
+    }
+    auto constantMatrixOp = matrix.getDefiningOp<arith::ConstantOp>();
+    if (!constantMatrixOp) {
+      return rewriter.notifyMatchFailure(op, "matrix is not a constant");
+    }
+    auto elementsAttr = dyn_cast<ElementsAttr>(constantMatrixOp.getValue());
+    if (!elementsAttr) {
+      return rewriter.notifyMatchFailure(op, "matrix is not an ElementsAttr");
+    }
+    std::function<Attribute(int64_t)> readElement =
+        constantElementReader(elementsAttr);
+    if (!readElement) {
+      return rewriter.notifyMatchFailure(op,
+                                         "matrix elements are not readable");
+    }
+
+    auto matrixType = cast<RankedTensorType>(matrix.getType());
+    auto convertedMatrixType = cast<ShapedType>(
+        getTypeConverter()->convertType(matrixType, matrixLayout));
+    if (!convertedMatrixType) {
+      return rewriter.notifyMatchFailure(op, "failed to convert matrix type");
+    }
+
+    int64_t numDiagonals = convertedMatrixType.getShape()[0];
+    int64_t numCols = matrixType.getDimSize(1);
+
+    int64_t slots = convertedMatrixType.getShape()[1];
+    auto elementType = matrixType.getElementType();
+
+    Attribute zeroAttr = rewriter.getZeroAttr(elementType);
+    std::vector<Attribute> diagonalValues(numDiagonals * slots, zeroAttr);
+
+    auto matrixRelation = matrixLayout.getIntegerRelation();
+    PointPairCollector collector(2, 2);
+    enumeratePoints(matrixRelation, collector);
+    for (const auto& pointPair : collector.points) {
+      int64_t row = pointPair.first[0];
+      int64_t col = pointPair.first[1];
+      int64_t d = pointPair.second[0];
+      int64_t s = pointPair.second[1];
+
+      int64_t flatIndex = row * numCols + col;
+      Attribute val = readElement(flatIndex);
+      diagonalValues[d * slots + s] = val;
+    }
+
+    std::vector<int64_t> nonZeroDiagonalIndices;
+    std::vector<Attribute> nonZeroDiagonalValues;
+    for (int64_t d = 0; d < numDiagonals; ++d) {
+      bool isZero = true;
+      for (int64_t s = 0; s < slots; ++s) {
+        if (diagonalValues[d * slots + s] != zeroAttr) {
+          isZero = false;
+          break;
+        }
+      }
+      if (!isZero) {
+        nonZeroDiagonalIndices.push_back(d);
+        for (int64_t s = 0; s < slots; ++s) {
+          nonZeroDiagonalValues.push_back(diagonalValues[d * slots + s]);
+        }
+      }
+    }
+
+    auto diagonalsType = RankedTensorType::get(
+        {static_cast<int64_t>(nonZeroDiagonalIndices.size()), slots},
+        elementType);
+    auto diagonalsAttr =
+        DenseElementsAttr::get(diagonalsType, nonZeroDiagonalValues);
+    auto diagonalIndicesAttr =
+        rewriter.getDenseI64ArrayAttr(nonZeroDiagonalIndices);
+
+    auto resultLayout = findAttributeAssociatedWith(
+        op.getResult(0), tensor_ext::TensorExtDialect::kLayoutAttrName);
+    if (failed(resultLayout)) {
+      return rewriter.notifyMatchFailure(op, "missing output layout");
+    }
+
+    auto outputType = op.getResult(0).getType();
+    auto convertedOutputType =
+        getTypeConverter()->convertType(outputType, resultLayout.value());
+
+    rewriter.setInsertionPointAfter(op);
+    auto diagonalsValue = arith::ConstantOp::create(
+        rewriter, op.getLoc(), cast<TypedAttr>(diagonalsAttr));
+    setMaterializedAttr(diagonalsValue);
+    auto linearTransformOp = kernel::LinearTransformOp::create(
+        rewriter, op.getLoc(), convertedOutputType, adaptor.getInputs()[1],
+        diagonalsValue.getResult(), diagonalIndicesAttr,
+        /*source_row_indices=*/nullptr,
+        /*bsgs_ratio=*/nullptr);
+
+    setMaterializedAttr(linearTransformOp);
+    linearTransformOp->setAttr(kLayoutAttrName, resultLayout.value());
+
+    Value transformResult = linearTransformOp.getResult();
+    if (numDiagonals < numCols) {
+      auto transformed = cast<TypedValue<RankedTensorType>>(transformResult);
+      auto leaf = ArithmeticDagNode<SSAValue>::leaf(SSAValue(transformed));
+      auto foldKernel = implementSquatDiagonalFold<SSAValue>(
+          leaf,
+          std::vector<int64_t>(matrixType.getShape().begin(),
+                               matrixType.getShape().end()),
+          kernel::mlirTypeToDagType(transformed.getType()), /*unroll=*/true);
+      if (foldKernel != leaf) {
+        IRMaterializingVisitor visitor(
+            adaptor.getInputs()[1].getType(),
+            [&](Operation* createdOp) { setMaterializedAttr(createdOp); });
+        ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+        transformResult = visitor.process(foldKernel, b)[0];
+        auto* finalOp = transformResult.getDefiningOp();
+        finalOp->setAttr(kLayoutAttrName, resultLayout.value());
+        setMaterializedAttr(finalOp);
+      }
+    }
+
+    addBiasAndReplace(rewriter, op, transformResult, adaptor.getOutputs()[0],
+                      resultLayout.value());
+    return success();
+  }
+};
+
+// Emits the Halevi-Shoup transform as a compact rotate_and_reduce carrying the
+// diagonals, rather than expanding it into a rotate/multiply/accumulate DAG.
+// The op is marked as a linear transform so implement-rotate-and-reduce leaves
+// it for a backend that can evaluate one directly (which also keeps it opaque
+// to bootstrap placement). Zero diagonals of a mostly-zero matrix are dropped
+// and their offsets recorded, so the backend neither encodes nor rotates for
+// them.
+//
+// A squat packing (rows < cols) still needs the partial-rotate-and-reduce
+// afterwards, mirroring implementHaleviShoup.
+static Value emitCompactLinearTransform(
+    ContextAwareConversionPatternRewriter& rewriter, Location loc,
+    TypedValue<RankedTensorType> input, TypedValue<RankedTensorType> matrix,
+    ArrayRef<int64_t> matrixShape, Attribute layoutAttr,
+    const std::map<int, bool>& zeroDiagonals) {
+  int64_t numDiagonals = matrix.getType().getShape()[0];
+
+  SmallVector<int32_t> nonzeroIndices;
+  for (int64_t i = 0; i < numDiagonals; ++i) {
+    if (!zeroDiagonals.count(i)) nonzeroIndices.push_back(i);
+  }
+  // An all-present list is the same as no list.
+  if (static_cast<int64_t>(nonzeroIndices.size()) == numDiagonals) {
+    nonzeroIndices.clear();
+  }
+
+  bool isFloat = isa<FloatType>(input.getType().getElementType());
+  auto rar = tensor_ext::RotateAndReduceOp::create(
+      rewriter, loc, input, matrix, /*period=*/int64_t{1},
+      /*steps=*/numDiagonals,
+      /*reduceOp=*/llvm::StringRef(isFloat ? "arith.addf" : "arith.addi"));
+  rar->setAttr(tensor_ext::TensorExtDialect::kLintransAttrName,
+               rewriter.getUnitAttr());
+  if (!nonzeroIndices.empty()) {
+    rar->setAttr(tensor_ext::TensorExtDialect::kDiagonalIndicesAttrName,
+                 rewriter.getDenseI32ArrayAttr(nonzeroIndices));
+  }
+  rar->setAttr(kLayoutAttrName, layoutAttr);
+  setMaterializedAttr(rar);
+
+  auto transformed = cast<TypedValue<RankedTensorType>>(rar.getResult());
+  auto leaf = ArithmeticDagNode<SSAValue>::leaf(SSAValue(transformed));
+  auto foldKernel = implementSquatDiagonalFold<SSAValue>(
+      leaf, std::vector<int64_t>(matrixShape.begin(), matrixShape.end()),
+      kernel::mlirTypeToDagType(transformed.getType()), /*unroll=*/true);
+  // A square packing needs no fold, and the builder hands the leaf straight
+  // back.
+  if (foldKernel == leaf) return transformed;
+
+  IRMaterializingVisitor visitor(input.getType(), [&](Operation* createdOp) {
+    setMaterializedAttr(createdOp);
+  });
+  ImplicitLocOpBuilder b(loc, rewriter);
+  Value finalOutput = visitor.process(foldKernel, b)[0];
+  auto* finalOutputOp = finalOutput.getDefiningOp();
+  finalOutputOp->setAttr(kLayoutAttrName, layoutAttr);
+  setMaterializedAttr(finalOutputOp);
+  return finalOutput;
+}
 
 struct ConvertLinalgConv1D : public ConversionBase<linalg::Conv1DOp> {
  public:
@@ -1116,6 +1631,21 @@ struct ConvertLinalgConv2D : public ConversionBase<linalg::Conv2DOp> {
   bool unrollKernels;
 };
 
+// Rebuild the operand shape honoring any zero `tensor.pad` it folded into the
+// conv's `padding` parameter. `dataType` is the operand shape before that fold
+FailureOr<ConvMatrixOperand> foldedConvMatrixOperand(
+    Operation* op, RankedTensorType dataType) {
+  int64_t padding = getConvFoldedPadding(op);
+  std::optional<ConvMatrixOperand> matrixOperand =
+      foldConvSpatialPadding(dataType, padding);
+  if (!matrixOperand) {
+    return op->emitError() << kConvFoldedPaddingAttrName << " of " << padding
+                           << " does not fit this conv's data operand "
+                           << dataType;
+  }
+  return *matrixOperand;
+}
+
 struct ConvertLinalgConv1DNcwFcw
     : public ConversionBase<linalg::Conv1DNcwFcwOp> {
  public:
@@ -1153,7 +1683,21 @@ struct ConvertLinalgConv1DNcwFcw
     return isPowerOfTwoDims && isConv1dAsMatvec;
   }
 
-  void haleviShoupKernel(
+  FailureOr<RankedTensorType> expandedFilterShape(
+      linalg::Conv1DNcwFcwOp op) const {
+    auto filterType = cast<RankedTensorType>(op.getInputs()[1].getType());
+    auto dataType = cast<RankedTensorType>(op.getInputs()[0].getType());
+    int64_t stride =
+        llvm::to_vector(op.getStrides().getValues<int64_t>()).front();
+
+    FailureOr<ConvMatrixOperand> matrixOperand =
+        foldedConvMatrixOperand(op, dataType);
+    if (failed(matrixOperand)) return failure();
+    return get1dConvCwFcwFilterExpandedType(filterType, matrixOperand->dataType,
+                                            stride, matrixOperand->padding);
+  }
+
+  LogicalResult haleviShoupKernel(
       linalg::Conv1DNcwFcwOp op, OpAdaptor adaptor,
       ContextAwareConversionPatternRewriter& rewriter) const {
     LLVM_DEBUG(
@@ -1168,13 +1712,8 @@ struct ConvertLinalgConv1DNcwFcw
         cast<TypedValue<RankedTensorType>>(adaptor.getInputs()[1]);
     SSAValue matrixLeaf(matrix);
 
-    // The original matrix shape is the shape of the expanded filter before
-    // diagonalization.
-    RankedTensorType expandedMatrixType = get1dConvCwFcwFilterExpandedType(
-        cast<RankedTensorType>(op.getInputs()[1].getType()),
-        cast<RankedTensorType>(op.getInputs()[0].getType()),
-        llvm::to_vector(op.getStrides().getValues<int64_t>()).front(),
-        /*padding=*/0);
+    FailureOr<RankedTensorType> expandedMatrixType = expandedFilterShape(op);
+    if (failed(expandedMatrixType)) return failure();
     // Collect any zero diagonals of the filter matrix.
     LayoutAttr filterLayout = getLayoutAttr(adaptor.getInputs()[1]);
     auto filterRelation = filterLayout.getIntegerRelation();
@@ -1189,11 +1728,32 @@ struct ConvertLinalgConv1DNcwFcw
                << "Got " << zeroDiagonals.size()
                << " zero diagonals for filter: " << matrix << "\n");
 
+    std::vector<int64_t> matrixShapeForLayout(
+        expandedMatrixType->getShape().begin(),
+        expandedMatrixType->getShape().end());
+    // Layout propagation can record the result layout as a list of layouts to
+    // compose, as the expanded kernel below also handles.
+    Attribute resultLayout = op->getAttr(kLayoutAttrName);
+    if (auto arrayAttr = dyn_cast_or_null<ArrayAttr>(resultLayout)) {
+      resultLayout = LayoutAttr::composeLayouts(arrayAttr, op.getContext());
+    }
+
+    // Backends that evaluate a linear transform directly take the compact form.
+    auto target = getTargetConfig(op->getParentOfType<ModuleOp>());
+    if (resultLayout && succeeded(target) && target->hasKernelLinearTransform) {
+      Value compact = emitCompactLinearTransform(rewriter, op.getLoc(), data,
+                                                 matrix, matrixShapeForLayout,
+                                                 resultLayout, zeroDiagonals);
+      addBiasAndReplace(rewriter, op, compact, adaptor.getOutputs()[0],
+                        resultLayout);
+      return success();
+    }
+
     auto dagType = kernel::mlirTypeToDagType(data.getType(),
                                              data.getType().getShape().back());
     std::shared_ptr<ArithmeticDagNode<SSAValue>> implementedKernel =
         implementHaleviShoup(vectorLeaf, matrixLeaf,
-                             expandedMatrixType.getShape(), dagType,
+                             expandedMatrixType->getShape(), dagType,
                              zeroDiagonals,
                              /*unroll=*/unrollKernels);
 
@@ -1207,6 +1767,7 @@ struct ConvertLinalgConv1DNcwFcw
     // Add the initial accumulator value.
     Value result = adaptor.getOutputs()[0];
     addBiasAndReplace(rewriter, op, finalOutput, result, layoutAttr);
+    return success();
   }
 
   LogicalResult matchAndRewrite(
@@ -1223,8 +1784,7 @@ struct ConvertLinalgConv1DNcwFcw
     }
 
     if (supportsExpandedHaleviShoup(op, adaptor)) {
-      haleviShoupKernel(op, adaptor, rewriter);
-      return success();
+      return haleviShoupKernel(op, adaptor, rewriter);
     }
 
     return op.emitError() << "unsupported layout for 1d conv";
@@ -1272,7 +1832,33 @@ struct ConvertLinalgConv2DNchwFchw
     return isPowerOfTwoDims && isConv2dAsMatvec;
   }
 
-  void haleviShoupKernel(
+  FailureOr<RankedTensorType> expandedFilterShape(
+      linalg::Conv2DNchwFchwOp op) const {
+    auto filterType = cast<RankedTensorType>(op.getInputs()[1].getType());
+    RankedTensorType dataType =
+        cast<RankedTensorType>(op.getInputs()[0].getType());
+    auto infoAttr = op->getAttr(kKernelInfoAttrName);
+    auto info = getKernelInfo(infoAttr);
+    if (info && !info->inputShape.empty()) {
+      // Use the kernel info attribute's input shape for the kernel. This
+      // accounts for any padding on the data-semantic tensor to allow for
+      // channel packing.
+      dataType =
+          RankedTensorType::get(info->inputShape, dataType.getElementType());
+    }
+
+    FailureOr<ConvMatrixOperand> matrixOperand =
+        foldedConvMatrixOperand(op, dataType);
+    if (failed(matrixOperand)) return failure();
+    auto strides = llvm::to_vector(op.getStrides().getValues<int64_t>());
+    // Rows only interchange for a strided conv; keep this in step with
+    // LayoutPropagation, which sizes the filter layout the same way.
+    return get2dConvChwFchwFilterExpandedType(
+        filterType, matrixOperand->dataType, matrixOperand->padding, strides,
+        /*interchangeRows=*/strides[0] > 1);
+  }
+
+  LogicalResult haleviShoupKernel(
       linalg::Conv2DNchwFchwOp op, OpAdaptor adaptor,
       ContextAwareConversionPatternRewriter& rewriter) const {
     LLVM_DEBUG(
@@ -1287,22 +1873,11 @@ struct ConvertLinalgConv2DNchwFchw
         cast<TypedValue<RankedTensorType>>(adaptor.getInputs()[1]);
     SSAValue matrixLeaf(matrix);
 
-    RankedTensorType dataType =
-        cast<RankedTensorType>(op.getInputs()[0].getType());
-    auto infoAttr = op->getAttr(kKernelInfoAttrName);
-    if (auto info = getKernelInfo(infoAttr)) {
-      // Use the kernel info attribute's input shape for the kernel. This
-      // accounts for any padding on the data-semantic tensor to allow for
-      // channel packing.
-      dataType =
-          RankedTensorType::get(info->inputShape, dataType.getElementType());
-    }
-
     // The original matrix shape is the shape of the expanded filter before
     // diagonalization.
-    RankedTensorType expandedMatrixType = get2dConvChwFchwFilterExpandedType(
-        cast<RankedTensorType>(op.getInputs()[1].getType()), dataType,
-        /*padding=*/0, llvm::to_vector(op.getStrides().getValues<int64_t>()));
+    FailureOr<RankedTensorType> expandedMatrixType = expandedFilterShape(op);
+    if (failed(expandedMatrixType)) return failure();
+
     // Collect any zero diagonals of the filter matrix.
     LayoutAttr filterLayout = getLayoutAttr(adaptor.getInputs()[1]);
     auto filterRelation = filterLayout.getIntegerRelation();
@@ -1317,12 +1892,31 @@ struct ConvertLinalgConv2DNchwFchw
                << "Got " << zeroDiagonals.size()
                << " zero diagonals for filter: " << matrix << "\n");
 
+    std::vector<int64_t> matrixShapeForLayout =
+        expandedMatrixType->getShape().vec();
+    // Layout propagation can record the result layout as a list of layouts to
+    // compose, as the expanded kernel below also handles.
+    Attribute resultLayout = op->getAttr(kLayoutAttrName);
+    if (auto arrayAttr = dyn_cast_or_null<ArrayAttr>(resultLayout)) {
+      resultLayout = LayoutAttr::composeLayouts(arrayAttr, op.getContext());
+    }
+
+    // Backends that evaluate a linear transform directly take the compact form.
+    auto target = getTargetConfig(op->getParentOfType<ModuleOp>());
+    if (resultLayout && succeeded(target) && target->hasKernelLinearTransform) {
+      Value compact = emitCompactLinearTransform(rewriter, op.getLoc(), data,
+                                                 matrix, matrixShapeForLayout,
+                                                 resultLayout, zeroDiagonals);
+      addBiasAndReplace(rewriter, op, compact, adaptor.getOutputs()[0],
+                        resultLayout);
+      return success();
+    }
+
     auto dagType = kernel::mlirTypeToDagType(data.getType(),
                                              data.getType().getShape().back());
     std::shared_ptr<ArithmeticDagNode<SSAValue>> implementedKernel =
-        implementHaleviShoup(vectorLeaf, matrixLeaf,
-                             expandedMatrixType.getShape(), dagType,
-                             zeroDiagonals,
+        implementHaleviShoup(vectorLeaf, matrixLeaf, matrixShapeForLayout,
+                             dagType, zeroDiagonals,
                              /*unroll=*/unrollKernels);
 
     rewriter.setInsertionPointAfter(op);
@@ -1337,6 +1931,7 @@ struct ConvertLinalgConv2DNchwFchw
     // Add the initial accumulator value.
     Value result = adaptor.getOutputs()[0];
     addBiasAndReplace(rewriter, op, finalOutput, result, layoutAttr);
+    return success();
   }
 
   LogicalResult matchAndRewrite(
@@ -1353,8 +1948,7 @@ struct ConvertLinalgConv2DNchwFchw
     }
 
     if (supportsExpandedHaleviShoup(op, adaptor)) {
-      haleviShoupKernel(op, adaptor, rewriter);
-      return success();
+      return haleviShoupKernel(op, adaptor, rewriter);
     }
 
     return op.emitError() << "unsupported layout for 2d conv";
@@ -1620,6 +2214,127 @@ class ConvertTensorExtractLayout
     setAttributeAssociatedWith(convertLayoutOp.getResult(), kLayoutAttrName,
                                resultLayout);
     rewriter.replaceOp(op, convertLayoutOp);
+    return success();
+  }
+};
+
+class ConvertTensorPad : public ContextAwareOpConversionPattern<tensor::PadOp> {
+ public:
+  using ContextAwareOpConversionPattern<
+      tensor::PadOp>::ContextAwareOpConversionPattern;
+
+  LogicalResult secretSourceSecretResult(
+      tensor::PadOp op, OpAdaptor adaptor,
+      ContextAwareConversionPatternRewriter& rewriter) const {
+    auto sourceTy = dyn_cast<RankedTensorType>(
+        maybeExtractSecretType(op.getSource().getType()));
+    auto resultTy = dyn_cast<RankedTensorType>(
+        maybeExtractSecretType(op.getResult().getType()));
+    if (!sourceTy || !resultTy || !sourceTy.hasStaticShape() ||
+        !resultTy.hasStaticShape()) {
+      return op.emitError("Only static shapes are supported for secret pad");
+    }
+    for (int64_t val : op.getStaticLow()) {
+      if (ShapedType::isDynamic(val)) {
+        return op.emitError(
+            "Only static low padding is supported for secret pad");
+      }
+    }
+    for (int64_t val : op.getStaticHigh()) {
+      if (ShapedType::isDynamic(val)) {
+        return op.emitError(
+            "Only static high padding is supported for secret pad");
+      }
+    }
+
+    FailureOr<Attribute> sourceLayoutResult =
+        getTypeConverter()->getContextualAttr(adaptor.getSource());
+    FailureOr<Attribute> resultLayoutResult =
+        getTypeConverter()->getContextualAttr(op.getResult());
+
+    LayoutAttr sourceLayout = cast<LayoutAttr>(sourceLayoutResult.value());
+    LayoutAttr resultLayout = cast<LayoutAttr>(resultLayoutResult.value());
+
+    // Check if padded value is constant 0.
+    Block& body = op.getRegion().front();
+    auto yieldOp = cast<tensor::YieldOp>(body.getTerminator());
+    Value yieldedValue = yieldOp.getValue();
+
+    if (!matchPattern(yieldedValue, m_AnyZeroFloat()) &&
+        !matchPattern(yieldedValue, m_Zero())) {
+      return op.emitError("Only zero padding is supported");
+    }
+
+    // Check if sourceCTType == targetCTType
+    auto sourceCTType = cast<RankedTensorType>(adaptor.getSource().getType());
+    auto targetCTType =
+        getTypeConverter()->convertType(op.getResultType(), resultLayout);
+    if (!targetCTType) {
+      return op.emitError("failed to convert target type");
+    }
+    if (sourceCTType != targetCTType) {
+      return op.emitError("Unsupported pad that changes number of ciphertexts");
+    }
+
+    SmallVector<int64_t> lowPadding = llvm::to_vector(op.getStaticLow());
+
+    IntegerRelation paddingRel =
+        getPaddingRelation(op.getResultType(), op.getSourceType(), lowPadding);
+
+    IntegerRelation sourceRel = sourceLayout.getIntegerRelation();
+    IntegerRelation resultRel = resultLayout.getIntegerRelation();
+
+    paddingRel.inverse();
+    sourceRel.inverse();
+    sourceRel.compose(paddingRel);
+    sourceRel.compose(resultRel);
+
+    LayoutAttr remapLayoutAttr =
+        LayoutAttr::getFromIntegerRelation(op.getContext(), sourceRel);
+
+    auto resultCiphertextSemanticType = cast<RankedTensorType>(targetCTType);
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    auto remapAndExtract = remapAndExtractResult(
+        b, adaptor.getSource(), remapLayoutAttr, resultCiphertextSemanticType);
+
+    setMaterializedAttr(remapAndExtract);
+    setAttributeAssociatedWith(remapAndExtract->getResult(0), kLayoutAttrName,
+                               resultLayout);
+    rewriter.replaceOp(op, remapAndExtract->getResult(0));
+    return success();
+  }
+
+  LogicalResult matchAndRewrite(
+      tensor::PadOp op, OpAdaptor adaptor,
+      ContextAwareConversionPatternRewriter& rewriter) const final {
+    if (hasMaterializedAttr(op)) return failure();
+
+    FailureOr<Attribute> sourceLayoutResult =
+        getTypeConverter()->getContextualAttr(adaptor.getSource());
+    FailureOr<Attribute> resultLayoutResult =
+        getTypeConverter()->getContextualAttr(op.getResult());
+
+    bool isSecretSource = succeeded(sourceLayoutResult);
+    bool isSecretResult = succeeded(resultLayoutResult);
+
+    if (isSecretSource && isSecretResult) {
+      return secretSourceSecretResult(op, adaptor, rewriter);
+    }
+
+    if (isSecretSource && !isSecretResult) {
+      return op.emitError()
+             << "result tensor should have been assigned a layout "
+                "by layout-propagation";
+    }
+
+    if (!isSecretSource && isSecretResult) {
+      return op.emitError()
+             << "source tensor should have been assigned a layout "
+                "by layout-propagation";
+    }
+
+    // Cleartext pad can be elided.
+    setMaterializedAttr(op);
     return success();
   }
 };
@@ -2464,6 +3179,100 @@ struct ConvertLinalgMatmul
     return dyn_cast<LayoutAttr>(layoutLookup.value());
   }
 
+  bool supportsBicyclicDiagonal(linalg::MatmulOp op) const {
+    auto kernelAttr = op->getAttrOfType<secret::KernelAttr>(
+        secret::SecretDialect::kKernelAttrName);
+    return kernelAttr &&
+           kernelAttr.getName() == KernelName::MatmulBicyclicDiagonal;
+  }
+
+  // Bicyclic matmul against a cleartext operand: the cleartext operand arrives
+  // packed as the generalized diagonal matrix (one row per summation step) and
+  // the kernel is a BSGS rotate-and-reduce of the secret operand over n steps,
+  // with rotation period m (the secret lhs's packed row count) or p (the secret
+  // rhs's packed column count).
+  void bicyclicDiagonalKernel(
+      linalg::MatmulOp op, OpAdaptor adaptor,
+      ContextAwareConversionPatternRewriter& rewriter) const {
+    LLVM_DEBUG(llvm::dbgs()
+               << "Converting linalg.matmul op with bicyclic diagonal "
+                  "kernel: "
+               << op << "\n");
+
+    // Determine if the lhs or rhs is the secret operand.
+    // Plaintext operands are packed via tensor_ext.assign_layout.
+    auto isCleartext = [](Value v) {
+      return isa_and_present<tensor_ext::AssignLayoutOp>(v.getDefiningOp());
+    };
+    bool secretLhs = false;
+    if (isCleartext(op.getInputs()[1]) && !isCleartext(op.getInputs()[0])) {
+      secretLhs = true;
+    } else if (!isCleartext(op.getInputs()[1]) &&
+               isCleartext(op.getInputs()[0])) {
+      secretLhs = false;
+    }
+
+    TypedValue<RankedTensorType> ct = cast<TypedValue<RankedTensorType>>(
+        adaptor.getInputs()[secretLhs ? 0 : 1]);
+    SSAValue ctLeaf(ct);
+    TypedValue<RankedTensorType> pt = cast<TypedValue<RankedTensorType>>(
+        adaptor.getInputs()[secretLhs ? 1 : 0]);
+    SSAValue ptLeaf(pt);
+
+    auto lhsType = cast<RankedTensorType>(op.getInputs()[0].getType());
+    auto rhsType = cast<RankedTensorType>(op.getInputs()[1].getType());
+    auto secretType = ct.getType();
+
+    auto dagType = kernel::mlirTypeToDagType(secretType);
+    int64_t period = secretLhs ? lhsType.getDimSize(0) : rhsType.getDimSize(1);
+    int64_t steps = secretLhs ? lhsType.getDimSize(1) : rhsType.getDimSize(0);
+    std::string reduceOp = isa<FloatType>(secretType.getElementType())
+                               ? "arith.addf"
+                               : "arith.addi";
+
+    std::shared_ptr<ArithmeticDagNode<SSAValue>> implementedKernel =
+        implementRotateAndReduce(ctLeaf, std::optional<SSAValue>(ptLeaf),
+                                 period, steps, dagType, /*zeroDiagonals=*/{},
+                                 reduceOp);
+
+    rewriter.setInsertionPointAfter(op);
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    IRMaterializingVisitor visitor(ct.getType(), [&](Operation* createdOp) {
+      setMaterializedAttr(createdOp);
+    });
+    Value finalOutput = visitor.process(implementedKernel, b)[0];
+
+    auto layoutAttr = cast<LayoutAttr>(op->getAttr(kLayoutAttrName));
+    auto* finalOutputOp = finalOutput.getDefiningOp();
+    finalOutputOp->setAttr(kLayoutAttrName, layoutAttr);
+    setMaterializedAttr(finalOutputOp);
+
+    // Add the initial accumulator value.
+    Value result = adaptor.getOutputs()[0];
+
+    Operation* addBias =
+        makeAppropriatelyTypedAddOp(b, op->getLoc(), finalOutput, result);
+    addBias->setAttr(kLayoutAttrName, layoutAttr);
+    setMaterializedAttr(addBias);
+
+    // Rebuild the full periodic output layout from the widest valid
+    // period-aligned window. The rotation reach of rotate-and-reduce with
+    // `steps` iterations of stride `period` is period * (steps - 1).
+    auto dataSemanticResultType =
+        cast<RankedTensorType>(op->getResult(0).getType());
+    int64_t reach = period * (steps - 1);
+    auto ctSemanticResultType =
+        cast<RankedTensorType>(addBias->getResult(0).getType());
+    int64_t validPrefix = ctSemanticResultType.getDimSize(1) - reach;
+    LLVM_DEBUG(llvm::dbgs() << "Bicyclic diagonal matmul valid prefix: "
+                            << validPrefix << "\n");
+    Operation* replicated = replicateValidPrefixOfResult(
+        b, addBias->getResult(0), layoutAttr,
+        dataSemanticResultType.getNumElements(), validPrefix);
+    setMaterializedAttr(replicated);
+    rewriter.replaceOp(op, replicated);
+  }
+
   bool supportsBicyclic(linalg::MatmulOp op, OpAdaptor adaptor) const {
     auto kernelAttr = op->getAttrOfType<secret::KernelAttr>(
         secret::SecretDialect::kKernelAttrName);
@@ -2510,12 +3319,35 @@ struct ConvertLinalgMatmul
         makeAppropriatelyTypedAddOp(b, op->getLoc(), finalOutput, result);
     addBias->setAttr(kLayoutAttrName, layoutAttr);
     setMaterializedAttr(addBias);
-    rewriter.replaceOp(op, addBias);
+
+    // Rebuild the full periodic output layout from the widest valid
+    // period-aligned window. For (m x n) * (n x p), the BSGS rotation reach
+    // is n * p - 1 + m * (n - 1).
+    auto dataSemanticResultType =
+        cast<RankedTensorType>(op->getResult(0).getType());
+    int64_t m = lhsType.getDimSize(0);
+    int64_t n = lhsType.getDimSize(1);
+    int64_t p = rhsType.getDimSize(1);
+    int64_t reach = n * p - 1 + m * (n - 1);
+    auto ctSemanticResultType =
+        cast<RankedTensorType>(addBias->getResult(0).getType());
+    int64_t validPrefix = ctSemanticResultType.getDimSize(1) - reach;
+    LLVM_DEBUG(llvm::dbgs()
+               << "Bicyclic matmul valid prefix: " << validPrefix << "\n");
+    Operation* replicated = replicateValidPrefixOfResult(
+        b, addBias->getResult(0), layoutAttr,
+        dataSemanticResultType.getNumElements(), validPrefix);
+    setMaterializedAttr(replicated);
+    rewriter.replaceOp(op, replicated);
   }
 
   LogicalResult matchAndRewrite(
       linalg::MatmulOp op, OpAdaptor adaptor,
       ContextAwareConversionPatternRewriter& rewriter) const final {
+    if (supportsBicyclicDiagonal(op)) {
+      bicyclicDiagonalKernel(op, adaptor, rewriter);
+      return success();
+    }
     if (supportsBicyclic(op, adaptor)) {
       bicyclicKernel(op, adaptor, rewriter);
       return success();
@@ -2569,8 +3401,9 @@ struct ConvertLinalgBatchMatmul
 
     rewriter.setInsertionPointAfter(op);
     ImplicitLocOpBuilder b(op.getLoc(), rewriter);
-    IRMaterializingVisitor visitor(
-        lhs.getType(), [&](Operation* createdOp) { setMaterializedAttr(op); });
+    IRMaterializingVisitor visitor(lhs.getType(), [&](Operation* createdOp) {
+      setMaterializedAttr(createdOp);
+    });
     Value finalOutput = visitor.process(implementedKernel, b)[0];
 
     auto layoutAttr = cast<LayoutAttr>(op->getAttr(kLayoutAttrName));
@@ -2584,17 +3417,158 @@ struct ConvertLinalgBatchMatmul
         makeAppropriatelyTypedAddOp(b, op->getLoc(), finalOutput, result);
     addBias->setAttr(kLayoutAttrName, layoutAttr);
     setMaterializedAttr(addBias);
-    rewriter.replaceOp(op, addBias);
+
+    // Rebuild the full periodic output layout from the widest valid
+    // period-aligned window. For (h x m x n) * (h x n x p), the BSGS rotation
+    // reach is h * n * p - 1 + h * m * (n - 1).
+    auto dataSemanticResultType =
+        cast<RankedTensorType>(op->getResult(0).getType());
+    int64_t h = lhsType.getShape()[0];
+    int64_t m = lhsType.getShape()[1];
+    int64_t n = lhsType.getShape()[2];
+    int64_t p = rhsType.getShape()[2];
+    int64_t reach = h * n * p - 1 + h * m * (n - 1);
+    auto ctSemanticResultType =
+        cast<RankedTensorType>(addBias->getResult(0).getType());
+    int64_t validPrefix = ctSemanticResultType.getDimSize(1) - reach;
+    LLVM_DEBUG(llvm::dbgs() << "Tricyclic batch matmul valid prefix: "
+                            << validPrefix << "\n");
+    Operation* replicated = replicateValidPrefixOfResult(
+        b, addBias->getResult(0), layoutAttr,
+        dataSemanticResultType.getNumElements(), validPrefix);
+    setMaterializedAttr(replicated);
+    rewriter.replaceOp(op, replicated);
+  }
+
+  bool supportsTricyclicDiagonal(linalg::BatchMatmulOp op) const {
+    auto kernelAttr = op->getAttrOfType<secret::KernelAttr>(
+        secret::SecretDialect::kKernelAttrName);
+    return kernelAttr &&
+           kernelAttr.getName() == KernelName::BatchMatmulTricyclicDiagonal;
+  }
+
+  // Ciphertext-plaintext batch matmul using tricyclic diagonal
+  // rotate-and-reduce.
+  void tricyclicDiagonalBatchKernel(
+      linalg::BatchMatmulOp op, OpAdaptor adaptor,
+      ContextAwareConversionPatternRewriter& rewriter) const {
+    LLVM_DEBUG(llvm::dbgs()
+               << "Converting linalg.batch_matmul with tricyclic diagonal "
+                  "kernel: "
+               << op << "\n");
+
+    // Determine if the lhs or rhs is the secret operand.
+    // Plaintext operands are packed via tensor_ext.assign_layout.
+    auto isCleartext = [](Value v) {
+      return isa_and_present<tensor_ext::AssignLayoutOp>(v.getDefiningOp());
+    };
+    bool secretLhs = false;
+    if (isCleartext(op.getInputs()[1]) && !isCleartext(op.getInputs()[0])) {
+      secretLhs = true;
+    } else if (!isCleartext(op.getInputs()[1]) &&
+               isCleartext(op.getInputs()[0])) {
+      secretLhs = false;
+    }
+
+    TypedValue<RankedTensorType> ct = cast<TypedValue<RankedTensorType>>(
+        adaptor.getInputs()[secretLhs ? 0 : 1]);
+    SSAValue ctLeaf(ct);
+    TypedValue<RankedTensorType> pt = cast<TypedValue<RankedTensorType>>(
+        adaptor.getInputs()[secretLhs ? 1 : 0]);
+    SSAValue ptLeaf(pt);
+
+    auto lhsType = cast<RankedTensorType>(op.getInputs()[0].getType());
+    auto rhsType = cast<RankedTensorType>(op.getInputs()[1].getType());
+    assert(lhsType.getDimSize(0) == rhsType.getDimSize(0) &&
+           "batch matrix multiplication inputs must share the same batch "
+           "dimension");
+    auto secretType = ct.getType();
+
+    auto dagType = kernel::mlirTypeToDagType(secretType);
+    int64_t period = secretLhs ? lhsType.getDimSize(0) * lhsType.getDimSize(1)
+                               : rhsType.getDimSize(0) * rhsType.getDimSize(2);
+    int64_t steps = secretLhs ? lhsType.getDimSize(2) : rhsType.getDimSize(1);
+    std::string reduceOp = isa<FloatType>(secretType.getElementType())
+                               ? "arith.addf"
+                               : "arith.addi";
+
+    std::shared_ptr<ArithmeticDagNode<SSAValue>> implementedKernel =
+        implementRotateAndReduce(ctLeaf, std::optional<SSAValue>(ptLeaf),
+                                 period, steps, dagType, /*zeroDiagonals=*/{},
+                                 reduceOp);
+
+    rewriter.setInsertionPointAfter(op);
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    IRMaterializingVisitor visitor(ct.getType(), [&](Operation* createdOp) {
+      setMaterializedAttr(createdOp);
+    });
+    Value finalOutput = visitor.process(implementedKernel, b)[0];
+
+    auto layoutAttr = cast<LayoutAttr>(op->getAttr(kLayoutAttrName));
+    auto* finalOutputOp = finalOutput.getDefiningOp();
+    finalOutputOp->setAttr(kLayoutAttrName, layoutAttr);
+    setMaterializedAttr(finalOutputOp);
+
+    // Add the initial accumulator value.
+    Value result = adaptor.getOutputs()[0];
+
+    Operation* addBias =
+        makeAppropriatelyTypedAddOp(b, op->getLoc(), finalOutput, result);
+    addBias->setAttr(kLayoutAttrName, layoutAttr);
+    setMaterializedAttr(addBias);
+
+    // Rebuild the full periodic output layout from the widest valid
+    // period-aligned window.
+    auto dataSemanticResultType =
+        cast<RankedTensorType>(op->getResult(0).getType());
+    int64_t reach = period * (steps - 1);
+    auto ctSemanticResultType =
+        cast<RankedTensorType>(addBias->getResult(0).getType());
+    int64_t validPrefix = ctSemanticResultType.getDimSize(1) - reach;
+    LLVM_DEBUG(llvm::dbgs() << "Tricyclic diagonal matmul valid prefix: "
+                            << validPrefix << "\n");
+    Operation* replicated = replicateValidPrefixOfResult(
+        b, addBias->getResult(0), layoutAttr,
+        dataSemanticResultType.getNumElements(), validPrefix);
+    setMaterializedAttr(replicated);
+    rewriter.replaceOp(op, replicated);
   }
 
   LogicalResult matchAndRewrite(
       linalg::BatchMatmulOp op, OpAdaptor adaptor,
       ContextAwareConversionPatternRewriter& rewriter) const final {
+    if (supportsTricyclicDiagonal(op)) {
+      tricyclicDiagonalBatchKernel(op, adaptor, rewriter);
+      return success();
+    }
     if (supportsTricyclic(op, adaptor)) {
       tricyclicKernel(op, adaptor, rewriter);
       return success();
     }
     return failure();
+  }
+};
+
+struct ConvertBootstrap : public ConversionBase<mgmt::BootstrapOp> {
+  using ConversionBase<mgmt::BootstrapOp>::ConversionBase;
+
+  LogicalResult matchAndRewrite(
+      mgmt::BootstrapOp op, OpAdaptor adaptor,
+      ContextAwareConversionPatternRewriter& rewriter) const final {
+    LayoutAttr layout = getLayoutAttr(adaptor.getInput());
+    if (!layout) {
+      return op.emitOpError("could not find layout for input");
+    }
+    Type newType = getTypeConverter()->convertType(op.getType(), layout);
+    if (!newType) {
+      return failure();
+    }
+
+    auto newOp = rewriter.replaceOpWithNewOp<mgmt::BootstrapOp>(
+        op, newType, adaptor.getInput());
+    setMaterializedAttr(newOp);
+    newOp->setAttr(kLayoutAttrName, layout);
+    return success();
   }
 };
 
@@ -2615,13 +3589,15 @@ struct ConvertToCiphertextSemantics
     target.markUnknownOpDynamicallyLegal([&](Operation* op) {
       return isa<ModuleOp>(op) || hasMaterializedAttr(op);
     });
-
-    patterns.add<ConvertAnyAddingMaterializedAttr, ConvertConvertLayout,
-                 ConvertFunc, ConvertLinalgMatmul, ConvertLinalgBatchMatmul,
-                 ConvertLinalgReduce, ConvertLinalgDot, ConvertSecretGeneric,
-                 ConvertTensorCollapseShape, ConvertTensorExpandShape,
-                 ConvertTensorExtractLayout, ConvertTensorExtractSlice,
-                 ConvertTensorInsertLayout, ConvertTensorInsertSlice>(
+    patterns.add<
+        ConvertAnyAddingMaterializedAttr, ConvertBootstrap,
+        ConvertConvertLayout, ConvertFunc, ConvertLinalgBroadcast,
+        ConvertLinalgMatmul, ConvertLinalgTranspose, ConvertLinalgBatchMatmul,
+        ConvertLinalgReduce, ConvertBroadcastedReduce, ConvertLinalgDot,
+        ConvertSecretGeneric, ConvertTensorCollapseShape,
+        ConvertTensorExpandShape, ConvertTensorExtractLayout,
+        ConvertTensorExtractSlice, ConvertTensorPad, ConvertTensorInsertLayout,
+        ConvertTensorInsertSlice, PreserveLinalgMatvecAsLinearTransform>(
         typeConverter, context);
     patterns.add<ConvertLinalgMatvecLayout, ConvertLinalgConv1D,
                  ConvertLinalgConv2D, ConvertLinalgConv2DNchwFchw,
